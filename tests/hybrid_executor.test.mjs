@@ -49,3 +49,25 @@ test('hybrid processJobs on Worker leaves heavy compute queued',async()=>{
   assert.equal(out.length,0);
   assert.equal(DB.raw.prepare("SELECT status FROM jobs WHERE type='compute_candidate'").get().status,'queued');
 });
+
+test('GitHub hybrid prioritizes compute_candidate over low-priority-number shared advance jobs',async()=>{
+  const DB=makeDb(),id=await seedProject(DB,{candidates:1,reviewer:0,episodes:0});
+  DB.raw.exec('DELETE FROM jobs');
+  // Reproduce v0.7.4 starvation: advance priority 5, compute priority 40.
+  await enqueue({DB,COMPUTE_EXECUTOR:'hybrid'},id,'advance_project',{},5);
+  await enqueue({DB,COMPUTE_EXECUTOR:'hybrid'},id,'compute_candidate',{candidate_id:'cand_0',phase:'exploration',cycle:0},40);
+  const github=await claimJobs({DB,COMPUTE_EXECUTOR:'hybrid',EXTERNAL_RUNTIME:'github-actions'},1);
+  assert.equal(github.length,1);
+  assert.equal(github[0].type,'compute_candidate');
+});
+
+test('scheduleAll demotes stale queued advance jobs while pending candidates need compute',async()=>{
+  const DB=makeDb(),id=await seedProject(DB,{candidates:1,reviewer:0,episodes:0});
+  DB.raw.exec("DELETE FROM jobs");
+  DB.raw.prepare("UPDATE design_candidates SET status='pending' WHERE project_id=?").run(id);
+  await enqueue({DB,COMPUTE_EXECUTOR:'hybrid'},id,'advance_project',{},5);
+  const {scheduleAll}=await import('../src/lib/orchestrator.js');
+  await scheduleAll({DB,COMPUTE_EXECUTOR:'hybrid',EXTERNAL_RUNTIME:'github-actions'},{process:false});
+  const row=DB.raw.prepare("SELECT priority FROM jobs WHERE project_id=? AND type='advance_project' AND status='queued' ORDER BY created_at LIMIT 1").get(id);
+  assert.equal(row.priority,90);
+});

@@ -202,6 +202,12 @@ export async function processFastLane(env,{rounds=3}={}){
 
 export async function scheduleAll(env,{process=true}={}){
   if(env.COMPUTE_EXECUTOR==='github-actions'&&env.EXTERNAL_RUNTIME!=='github-actions')return {transport:'github-actions',status:'waiting_for_runner'};
+  // v0.7.5 starvation repair: a queued advance_project from older builds may still have
+  // priority 5. Demote it before selecting projects so GitHub can claim compute_candidate
+  // first even when the existing advance job causes the project to be omitted below.
+  await run(env.DB,`UPDATE jobs SET priority=90,updated_at=? WHERE type='advance_project' AND status='queued' AND priority<90
+    AND EXISTS(SELECT 1 FROM projects p JOIN design_candidates c ON c.project_id=p.id AND c.research_cycle=p.research_cycle
+      WHERE p.id=jobs.project_id AND c.status='pending')`,[new Date().toISOString()]);
   // 완료된 프로젝트는 대상에서 제외(이전: 모든 auto_run 프로젝트에 15분마다 advance + 데이터소스 집계)
   // Two indexed EXISTS probes inside ONE bounded set query replace N per-project reads.
   const ps=await all(env.DB,`SELECT p.id,
@@ -213,10 +219,8 @@ export async function scheduleAll(env,{process=true}={}){
       OR (NOT EXISTS(SELECT 1 FROM jobs b WHERE b.project_id=p.id AND b.type='collect_project' AND b.status IN ('queued','running'))
         AND EXISTS(SELECT 1 FROM data_sources d WHERE d.project_id=p.id AND d.enabled=1 AND (d.last_fetched_at IS NULL OR datetime(d.last_fetched_at, '+' || d.cadence_minutes || ' minutes')<=datetime('now')))))
     ORDER BY p.updated_at,p.id LIMIT 4`);
-  const repairIds=ps.filter(p=>p.pending_compute).map(p=>p.id);
-  if(repairIds.length)await run(env.DB,`UPDATE jobs SET priority=5 WHERE type='advance_project' AND status='queued' AND priority>5 AND project_id IN (SELECT value FROM json_each(?))`,[JSON.stringify(repairIds)]);
   for(const p of ps){
-    await enqueueOnce(env,p.id,'advance_project',{},p.pending_compute?5:99);
+    await enqueueOnce(env,p.id,'advance_project',{},p.pending_compute?90:99);
     if(p.due&&!p.collecting&&!p.pending_compute)await enqueueOnce(env,p.id,'collect_project',{refresh:true},25);
   }
   // Progress reports are available before human/sign-off gates pass; coalesce pending work.

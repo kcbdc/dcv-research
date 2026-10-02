@@ -1,3 +1,10 @@
+## v0.7.5 — GitHub Compute Starvation Fix
+
+- GitHub hybrid claim order now prioritizes `compute_candidate`, then validation/reviewer jobs, then other heavy jobs, and only then shared transition jobs.
+- Pending compute no longer promotes `advance_project` to priority 5; queued stale advance jobs are automatically demoted to priority 90.
+- Fixes the observed state where `compute_candidate` stayed queued with attempts=0 while `advance_project` completed every five minutes.
+- Added regression tests for starvation reproduction and automatic priority repair.
+
 ## v0.7.4 — Aggressive Hybrid Fast Path
 
 - Expanded Cloudflare Worker fast-path to `measure_project` and `seed_candidates`.
