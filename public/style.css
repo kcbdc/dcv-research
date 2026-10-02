@@ -728,3 +728,6 @@ body{background:var(--cw-bg)!important;color:var(--cw-ink)!important;overflow-x:
 .exec-badge.worker{background:#e7f8f1;color:#08795b;border:1px solid #bcebdc}
 .exec-badge.shared{background:#eef4ff;color:#285fa8;border:1px solid #c9daf7}
 .exec-badge.github{background:#fff5e6;color:#9a5a00;border:1px solid #f2d39e}
+
+.participant-session{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 14px;margin:10px 0 12px;border:1px solid var(--line,#d9e3ee);border-radius:12px;background:rgba(245,249,253,.75)}
+.participant-session>div{display:flex;min-width:0;flex-direction:column;gap:2px}.participant-session small,.participant-session span{font-size:12px;color:var(--muted,#687789)}.participant-session b{font-size:15px;letter-spacing:.03em;color:var(--ink,#102a43)}.participant-session .btn-sm{white-space:nowrap;padding:7px 10px}.participant-note{display:block;margin-top:9px;line-height:1.45;color:var(--muted,#687789)}

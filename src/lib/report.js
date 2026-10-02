@@ -18,7 +18,7 @@ const estName = e => EST[e] || e;
 export function checklist(t) {
   const items = [], rv = t.reviewer, pn = t.empirical.panel, c = t.candidates, lc=t.empirical.loss_calibration;
   const minP=Number(t.definition.content?.validation?.min_human_participants||30);
-  if (rv.participants < minP) items.push(`인간실험 참가자가 ${rv.participants}명으로 사전 기준 ${minP}명에 미달합니다. 반복 trial 수가 많아도 참가자 수를 대체하지 못합니다.`);
+  if (rv.participants < minP) items.push(`현재 규약·연구주기의 인간실험 참가자가 ${rv.participants}명으로 사전 기준 ${minP}명에 미달합니다${rv.cumulative_participants!=null?`(누적 ${rv.cumulative_participants}명)`:''}. 반복 trial 수가 많아도 참가자 수를 대체하지 못합니다.`);
   if (!rv.cluster_bootstrap?.B) items.push('반복측정 인간실험의 참가자-군집 bootstrap 불확실성 추정이 아직 없습니다.');
   if (pn.n && pn.estimated / pn.n > 0.5) items.push(`위기 사례 ${pn.n}건 중 reconstructed 자료가 ${pn.estimated}건(${pct(pn.estimated / pn.n, 0)})입니다. 결과는 이 재구성 규칙에 조건부임을 본문과 표에 유지하십시오.`);
   if (t.empirical.readiness !== 'FULL_EPISODE_PANEL') items.push(`실증 패널이 완전하지 않습니다(${t.empirical.complete_rows}/${t.empirical.target_rows}).`);
