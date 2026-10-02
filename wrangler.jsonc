@@ -32,7 +32,12 @@
     "LAB_DEADLINE_AT": "2026-10-30T14:59:59.000Z",
     "LAB_AI_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
     "SIM_BATCH_SIZE": "180",
-    "COMPUTE_EXECUTOR": "hybrid"
+    "COMPUTE_EXECUTOR": "hybrid",
+    "GITHUB_OWNER": "kcbcdc",
+    "GITHUB_REPO": "dcv-research-platform",
+    "GITHUB_WORKFLOW": "dcv-research.yml",
+    "GITHUB_REF": "main",
+    "GITHUB_DISPATCH_COOLDOWN_SECONDS": "180"
   },
   "triggers": {
     "crons": [

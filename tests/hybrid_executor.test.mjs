@@ -71,3 +71,41 @@ test('scheduleAll demotes stale queued advance jobs while pending candidates nee
   const row=DB.raw.prepare("SELECT priority FROM jobs WHERE project_id=? AND type='advance_project' AND status='queued' ORDER BY created_at LIMIT 1").get(id);
   assert.equal(row.priority,90);
 });
+
+test('hybrid heavy enqueue event-dispatches GitHub once and cooldown coalesces bursts',async()=>{
+  const DB=makeDb(),id=await seedProject(DB,{candidates:1,reviewer:0,episodes:0});
+  DB.raw.exec('DELETE FROM jobs');
+  let calls=0;
+  const env={
+    DB,COMPUTE_EXECUTOR:'hybrid',
+    GITHUB_ACTIONS_TOKEN:'secret-token',GITHUB_OWNER:'kcbcdc',GITHUB_REPO:'dcv-research-platform',GITHUB_WORKFLOW:'dcv-research.yml',GITHUB_REF:'main',
+    GITHUB_FETCH:async(url,opts)=>{calls++;assert.match(url,/actions\/workflows\/dcv-research\.yml\/dispatches$/);assert.equal(JSON.parse(opts.body).ref,'main');return new Response(null,{status:204});}
+  };
+  await enqueue(env,id,'compute_candidate',{candidate_id:'cand_0',phase:'exploration',cycle:0},40);
+  await enqueue(env,id,'validate_project',{},50);
+  assert.equal(calls,1);
+  const state=DB.raw.prepare("SELECT lease_until FROM external_runner_leases WHERE id='github-dispatch'").get();
+  assert.ok(state?.lease_until);
+});
+
+test('hybrid worker-fast enqueue does not dispatch GitHub',async()=>{
+  const DB=makeDb(),id=await seedProject(DB,{candidates:1,reviewer:0,episodes:0});
+  DB.raw.exec('DELETE FROM jobs');
+  let calls=0;
+  const env={DB,COMPUTE_EXECUTOR:'hybrid',GITHUB_ACTIONS_TOKEN:'secret-token',GITHUB_OWNER:'kcbcdc',GITHUB_REPO:'dcv-research-platform',GITHUB_FETCH:async()=>{calls++;return new Response(null,{status:204});}};
+  await enqueue(env,id,'measure_project',{},30);
+  assert.equal(calls,0);
+});
+
+test('runner status exposes configuration and queue health without exposing token',async()=>{
+  const {githubRunnerStatus}=await import('../src/lib/github_dispatch.js');
+  const DB=makeDb(),id=await seedProject(DB,{candidates:1,reviewer:0,episodes:0});
+  DB.raw.exec('DELETE FROM jobs');
+  // Insert without token so enqueue cannot dispatch; status should still describe the queue once configured.
+  await enqueue({DB,COMPUTE_EXECUTOR:'hybrid'},id,'compute_candidate',{candidate_id:'cand_0',phase:'exploration',cycle:0},40);
+  const status=await githubRunnerStatus({DB,COMPUTE_EXECUTOR:'hybrid',GITHUB_ACTIONS_TOKEN:'do-not-leak',GITHUB_OWNER:'kcbcdc',GITHUB_REPO:'dcv-research-platform'});
+  assert.equal(status.configured,true);
+  assert.equal(status.heavy_due,1);
+  assert.equal('token' in status,false);
+  assert.doesNotMatch(JSON.stringify(status),/do-not-leak/);
+});

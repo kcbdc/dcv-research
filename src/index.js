@@ -5,6 +5,7 @@ import { requireAdmin } from './lib/auth.js';
 import { all, one, run, enqueue, enqueueOnce, audit } from './lib/db.js';
 import { bust } from './lib/memo.js';
 import { processJobs, processFastLane, scheduleAll, advanceProject } from './lib/orchestrator.js';
+import { dispatchGithubActionsIfNeeded, githubRunnerStatus } from './lib/github_dispatch.js';
 import { generateReport, upgradeStoredReport } from './lib/report.js';
 import { buildThesisData, exportCsv, EXPORT_NAMES } from './lib/thesis.js';
 import { aiJson } from './lib/ai.js';
@@ -195,12 +196,15 @@ async function api(request,env){
     if(parts[3]==='audit' && method==='GET'){ return json({audit:await all(env.DB,`SELECT * FROM audit_log WHERE project_id=? ORDER BY created_at DESC LIMIT 300`,[projectId])}); }
   }
 
+  if(url.pathname==='/api/runner/status' && method==='GET') return json(await githubRunnerStatus(env));
+  if(url.pathname==='/api/runner/dispatch' && method==='POST') return json(await dispatchGithubActionsIfNeeded(env,{force:false,reason:'manual_api'}));
+
   if(url.pathname==='/api/ai/test' && method==='GET'){
     const r=await aiJson(env,'You are a test assistant.','Say hello in Korean.',{ok:false},{schemaHint:'{"ok":true,"message":"string"}',maxTokens:100});
     return json({binding:!!env.AI,configured_model:env.AI_MODEL||null,result:r});
   }
   if(url.pathname==='/api/jobs/process' && method==='POST') return json({results:await processJobs(env)});
-  if(url.pathname==='/api/schedule' && method==='POST'){ const scheduled=await scheduleAll(env,{process:false}); const fast=env.COMPUTE_EXECUTOR==='hybrid'?await processFastLane(env,{rounds:3}):await processJobs(env); return json({scheduled,fast}); }
+  if(url.pathname==='/api/schedule' && method==='POST'){ const scheduled=await scheduleAll(env,{process:false}); const dispatch=env.COMPUTE_EXECUTOR==='hybrid'?await dispatchGithubActionsIfNeeded(env,{reason:'api_schedule'}):null; const fast=env.COMPUTE_EXECUTOR==='hybrid'?await processFastLane(env,{rounds:3}):await processJobs(env); return json({scheduled,dispatch,fast}); }
 
   if(url.pathname==='/api/studies' && method==='POST'){
     const b=await bodyJson(request), id=uid('study'); await run(env.DB,`INSERT INTO study_groups(id,name,created_at) VALUES(?,?,?)`,[id,b.name||'DCV Study',nowIso()]); return json({id},201);
@@ -221,7 +225,7 @@ export default {
     if(url.pathname.startsWith('/api/')) return api(request,env);
     return env.ASSETS.fetch(request);
   },
-  async scheduled(controller,env,ctx){ ctx.waitUntil((async()=>{ await scheduleAll(env,{process:false}); await processFastLane(env,{rounds:3}); await scheduleLab(env); })()); },
+  async scheduled(controller,env,ctx){ ctx.waitUntil((async()=>{ await scheduleAll(env,{process:false}); await dispatchGithubActionsIfNeeded(env,{reason:'worker_cron'}); await processFastLane(env,{rounds:3}); await scheduleLab(env); })()); },
   async queue(batch,env,ctx){
     for(const message of batch.messages){
       try{ await processJobs(env); message.ack(); }

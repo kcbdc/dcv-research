@@ -242,3 +242,23 @@ Initial project data retries automatically, thesis/report controls resolve the D
 
 ## v0.7.4 Aggressive Hybrid Fast Path
 Cloudflare Worker now handles measure/seed and short state-transition chains every minute; heavy simulation/validation/collection/report jobs remain on GitHub Actions. Shared transition jobs can be claimed by either runtime, so a running Actions job can continue directly into the next gate instead of waiting for the next Worker Cron. The dashboard labels each recent job as WORKER FAST, SHARED FAST, or GITHUB HEAVY.
+
+## Event-driven GitHub Actions wake-up (v0.7.6)
+
+Heavy research jobs no longer depend on the GitHub scheduler as the primary trigger. In hybrid mode the Worker dispatches `dcv-research.yml` when heavy work enters D1, while the 1-minute Worker Cron recovers any pre-existing backlog. GitHub's 5-minute cron is retained only as fallback.
+
+Cloudflare Worker must have this secret:
+
+```bash
+npx wrangler secret put GITHUB_ACTIONS_TOKEN
+```
+
+Use a GitHub token that can dispatch Actions for `kcbcdc/dcv-research-platform`. Non-secret routing values are already in `wrangler.jsonc`: `GITHUB_OWNER`, `GITHUB_REPO`, `GITHUB_WORKFLOW`, `GITHUB_REF`.
+
+Runtime diagnostics:
+
+```js
+fetch('/api/runner/status',{cache:'no-store'}).then(r=>r.json()).then(console.log)
+```
+
+`configured:true` and `heavy_due>0` should be followed by `dispatch_cooldown_active:true`, then `runner_active:true` or a newer `last_completed_at`.

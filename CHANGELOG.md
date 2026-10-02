@@ -1,3 +1,12 @@
+# v0.7.6 — Event-driven GitHub heavy runner
+
+- Cloudflare Worker now dispatches `dcv-research.yml` immediately when a GitHub-heavy job is enqueued.
+- Worker 1-minute Cron also checks existing heavy D1 backlog and dispatches Actions, so stranded pre-deployment jobs recover automatically.
+- D1 `external_runner_leases` provides a 180-second dispatch cooldown and active-runner detection to avoid dispatch storms.
+- Added `/api/runner/status` and `/api/runner/dispatch` diagnostics. Secrets are never returned.
+- GitHub 5-minute schedule remains as a fallback; event-driven Worker dispatch is now the primary trigger.
+- Preserves v0.7.5 starvation repair: GitHub prioritizes `compute_candidate` over shared transition jobs and demotes stale queued `advance_project`.
+
 ## v0.7.5 — GitHub Compute Starvation Fix
 
 - GitHub hybrid claim order now prioritizes `compute_candidate`, then validation/reviewer jobs, then other heavy jobs, and only then shared transition jobs.
