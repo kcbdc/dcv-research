@@ -74,14 +74,49 @@ export async function advanceProject(env,projectId){
 
   // active 후보가 남아 있으면 아직 탐색 중이므로 'unfinished' 작업 조회 없이 바로 반환(조회 1회 절약)
   if(active>0){
-    // Recover missing initial work in bounded batches. Never restart a completed run or retry permanent failures forever.
+    // v0.7.6 exhausted-job recovery:
+    // 이전 구현은 같은 후보의 compute_candidate 실패 이력이 3건 이상이면 그 후보를 영구히 제외했다.
+    // 버그/인프라 장애를 수정해 새 코드를 배포해도 design_candidates.status='pending'은 그대로라
+    // UI가 UNEVALUATED 108 같은 값에서 멈추는 교착이 발생할 수 있었다.
+    // 새 코드 revision마다 가장 최근의 exhausted exploration job을 딱 한 번만 되살린다.
+    // 같은 revision에서 다시 max_attempts를 소진하면 _recovery_revision 표식 때문에 또 되살리지 않아
+    // 결정론적 오류의 무한 재시도는 방지한다.
+    const recoveryRevision=String(env.RUNNER_CODE_REVISION||'unknown');
+    const recoveryTs=new Date().toISOString();
+    const recovered=await run(env.DB,`UPDATE jobs SET status='queued',attempts=0,locked_at=NULL,run_after=?,updated_at=?,
+      last_error='auto_recovered_after_code_revision',
+      payload_json=json_set(COALESCE(payload_json,'{}'),'$._recovery_revision',?)
+      WHERE id IN (
+        SELECT f.id FROM jobs f JOIN design_candidates c ON c.project_id=f.project_id
+          AND c.id=json_extract(f.payload_json,'$.candidate_id')
+        WHERE c.project_id=? AND c.research_cycle=? AND c.status='pending'
+          AND f.type='compute_candidate' AND f.status='failed'
+          AND COALESCE(json_extract(f.payload_json,'$.phase'),'exploration')='exploration'
+          AND COALESCE(json_extract(f.payload_json,'$._recovery_revision'),'')<>?
+          AND NOT EXISTS(SELECT 1 FROM simulation_runs r WHERE r.candidate_id=c.id AND r.phase='exploration')
+          AND NOT EXISTS(SELECT 1 FROM jobs q WHERE q.project_id=c.project_id AND q.type='compute_candidate'
+            AND json_extract(q.payload_json,'$.candidate_id')=c.id AND q.status IN ('queued','running'))
+          AND f.id=(SELECT f2.id FROM jobs f2 WHERE f2.project_id=f.project_id AND f2.type='compute_candidate'
+            AND f2.status='failed' AND json_extract(f2.payload_json,'$.candidate_id')=c.id
+            AND COALESCE(json_extract(f2.payload_json,'$.phase'),'exploration')='exploration'
+            ORDER BY f2.updated_at DESC,f2.created_at DESC LIMIT 1)
+        LIMIT 100
+      )`,[recoveryTs,recoveryTs,recoveryRevision,projectId,cycle,recoveryRevision]);
+    const recoveredCount=Number(recovered?.meta?.changes||0);
+
+    // 과거 실패 횟수 자체는 더 이상 영구 차단 근거로 사용하지 않는다. 현재 코드 revision에서
+    // 이미 한 번 자동복구 후 다시 exhausted 된 후보만 막는다. 새 후보/실패 없는 후보는 즉시 enqueue한다.
     const missing=await all(env.DB,`SELECT c.id FROM design_candidates c WHERE c.project_id=? AND c.research_cycle=? AND c.status='pending'
       AND NOT EXISTS(SELECT 1 FROM simulation_runs r WHERE r.candidate_id=c.id AND r.phase='exploration')
       AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.project_id=c.project_id AND j.type='compute_candidate' AND json_extract(j.payload_json,'$.candidate_id')=c.id AND j.status IN ('queued','running'))
-      AND (SELECT COUNT(*) FROM jobs f WHERE f.project_id=c.project_id AND f.type='compute_candidate' AND json_extract(f.payload_json,'$.candidate_id')=c.id AND f.status='failed')<3 LIMIT 100`,[projectId,cycle]);
-    if(missing.length)await ensureFrozenProtocol(env,projectId);
+      AND NOT EXISTS(SELECT 1 FROM jobs f WHERE f.project_id=c.project_id AND f.type='compute_candidate'
+        AND json_extract(f.payload_json,'$.candidate_id')=c.id AND f.status='failed'
+        AND json_extract(f.payload_json,'$._recovery_revision')=?)
+      LIMIT 100`,[projectId,cycle,recoveryRevision]);
+    if(recoveredCount||missing.length)await ensureFrozenProtocol(env,projectId);
     const queued=await enqueueMany(env,projectId,'compute_candidate',missing.map(c=>({candidate_id:c.id,phase:'exploration',cycle:0})),40);
-    await setStage(env,p,'compute'); return {stage:'cdrs_boundary_search',active,queued,total,waiting:queued?'recovered_missing_jobs':'inspect_failed_jobs'};
+    await setStage(env,p,'compute');
+    return {stage:'cdrs_boundary_search',active,recovered:recoveredCount,queued,total,waiting:(recoveredCount||queued)?'recovered_exhausted_or_missing_jobs':'current_revision_failures_require_inspection'};
   }
   const unfinished=await jobExists(env,projectId,'compute_candidate','exploration')||await jobExists(env,projectId,'compute_candidate','refinement')||await jobExists(env,projectId,'compute_candidate','confirmation');
   if(unfinished){ await setStage(env,p,'compute'); return {stage:'cdrs_boundary_search',active,queued:1,total}; }

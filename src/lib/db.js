@@ -114,7 +114,7 @@ export async function claimJobs(env, limit=4) {
   // An oversized collector must not block smaller compute jobs behind it. In hybrid mode,
   // the same indexed queue is partitioned by job type so Worker and Actions never steal each other's work.
   const laneOrder=lane==='github-hybrid'
-    ? `CASE WHEN type='compute_candidate' THEN 0 WHEN type IN ('validate_project','fit_reviewer') THEN 1 WHEN type IN (${SHARED_FAST_JOB_TYPES.map(x=>`'${x}'`).join(',')}) THEN 3 ELSE 2 END,`
+    ? `CASE WHEN type='compute_candidate' THEN 0 WHEN type='advance_project' THEN 1 WHEN type IN ('validate_project','fit_reviewer') THEN 2 WHEN type IN (${SHARED_FAST_JOB_TYPES.map(x=>`'${x}'`).join(',')}) THEN 3 ELSE 2 END,`
     : '';
   const jobs = await all(env.DB, `SELECT * FROM jobs WHERE status='queued' AND run_after<=?${laneSql}
     AND CASE type WHEN 'collect_project' THEN 180 WHEN 'generate_report' THEN 100 WHEN 'advance_project' THEN 90 ELSE 60 END<=?
