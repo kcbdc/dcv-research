@@ -22,6 +22,33 @@ import {labApi,scheduleLab} from './lib/lab.js';
 async function bodyJson(request){ try{return await request.json();}catch{return {};} }
 function pathParts(url){ return new URL(url).pathname.split('/').filter(Boolean); }
 
+// Hybrid self-heal: heavy compute normally belongs to GitHub Actions. If queued work sits
+// untouched while no external runner lease is active, first retry workflow dispatch. When
+// dispatch is unavailable, or the same heavy job remains stranded for a long grace period,
+// allow exactly one compute_candidate to run on the Worker. This breaks the queued/0-attempt
+// deadlock without turning the Worker into the normal heavy executor.
+export async function recoverHybridStall(env,{reason='self_heal'}={}){
+  if(String(env.COMPUTE_EXECUTOR||'')!=='hybrid') return {status:'not_hybrid'};
+  const status=await githubRunnerStatus(env);
+  if(!status.heavy_due) return {status:'no_heavy_work',runner:status};
+  if(status.runner_active) return {status:'runner_active',runner:status};
+  const dispatch=await dispatchGithubActionsIfNeeded(env,{reason});
+  const oldestMs=status.oldest_heavy_job?Date.parse(status.oldest_heavy_job):NaN;
+  const ageSeconds=Number.isFinite(oldestMs)?Math.max(0,Math.floor((Date.now()-oldestMs)/1000)):0;
+  const hardFailure=['not_configured','dispatch_failed','dispatch_network_error'].includes(dispatch?.status);
+  // Give a successful/cooldown dispatch time to acquire the runner lease. If it still has not
+  // started after 8 minutes, fall back regardless: a scheduled workflow/dispatch can be disabled
+  // independently of the application, and queued jobs must not remain permanently unevaluated.
+  const emergency=ageSeconds>=90&&hardFailure || ageSeconds>=480;
+  if(!emergency) return {status:'dispatch_pending',dispatch,age_seconds:ageSeconds,runner:status};
+  const fallbackEnv=Object.assign(Object.create(env),{
+    EMERGENCY_WORKER_COMPUTE:'1',
+    MAX_JOBS_PER_TICK:'1'
+  });
+  const results=await processFastLane(fallbackEnv,{rounds:1});
+  return {status:'worker_emergency',dispatch,age_seconds:ageSeconds,results,runner:status};
+}
+
 async function tableColumns(db, table){
   try{return new Set((await all(db,`PRAGMA table_info(${table})`)).map(x=>x.name));}catch{return new Set();}
 }
@@ -52,7 +79,7 @@ async function compatibleProjectList(env,pcols=null){
   return rows.map(r=>({...r,candidate_count:pcols.has('candidate_count')?Number(r.candidate_count||0):Number(ccounts[r.id]||0),reviewer_obs_count:pcols.has('reviewer_obs_count')?Number(r.reviewer_obs_count||0):Number(r.reviewer_obs_count||0),research_cycle:pcols.has('research_cycle')?Number(r.research_cycle||1):1,evidence_revision:pcols.has('evidence_revision')?Number(r.evidence_revision||0):0,approval_count:Number(acounts[r.id]||0)}));
 }
 
-async function api(request,env){
+async function api(request,env,ctx=null){
   const url=new URL(request.url), parts=pathParts(request.url), method=request.method.toUpperCase();
   if(url.pathname==='/api/health') return json({ok:true,app:env.APP_NAME||'DCV Research Platform',time:nowIso()});
   const auth=requireAdmin(request,env); if(auth) return auth;
@@ -88,6 +115,7 @@ async function api(request,env){
     }
     if(parts.length===3 && method==='GET'){
       const p=await one(env.DB,`SELECT * FROM projects WHERE id=?`,[projectId]); if(!p)return json({error:'not_found'},404);
+      if(ctx&&String(env.COMPUTE_EXECUTOR||'')==='hybrid') ctx.waitUntil(recoverHybridStall(env,{reason:'project_detail_poll'}).catch(()=>null));
       const def=await one(env.DB,`SELECT status,version,gate_json,content_json,ai_note,created_at FROM definitions WHERE project_id=? ORDER BY version DESC LIMIT 1`,[projectId]);
       const meas=await one(env.DB,`SELECT metrics_json,quality_json,measured_at FROM measurements WHERE project_id=? ORDER BY measured_at DESC LIMIT 1`,[projectId]);
       const cycle=Number(p.research_cycle||1),rev=Number(p.evidence_revision||0);
@@ -119,7 +147,7 @@ async function api(request,env){
         FROM reviewer_observations WHERE project_id=?`,[humanProtocol,humanProtocol,cycle,projectId]);
       return json({project:p,definition:def?{...def,gate:safeJson(def.gate_json,{}),content:safeJson(def.content_json,{}),ai:safeJson(def.ai_note,{})}:null,measurement:meas?{...meas,metrics:safeJson(meas.metrics_json,{}),quality:safeJson(meas.quality_json,{})}:null,candidates:{...counts,regret_meta:regretMeta},approval:app?{...app,basis:safeJson(app.basis_json,{})}:null,stale_approval:staleApproval?{...staleApproval,basis:safeJson(staleApproval.basis_json,{})}:null,approval_gates:gates,reviewer:reviewer?{...reviewer,model:safeJson(reviewer.model_json,{})}:null,jobs,runs,scenarios,human_reviews:Number(human?.observations||0),human_participants:Number(human?.participants||0),human_eligible_participants:Number(human?.eligible_participants||0),empirical,protocol});
     }
-    if(parts[3]==='run' && method==='POST'){ await run(env.DB,`UPDATE projects SET reviewer_hold_marker=NULL WHERE id=?`,[projectId]); if(env.COMPUTE_EXECUTOR==='github-actions'){await enqueueOnce(env,projectId,'advance_project',{},98);return json({status:'queued',transport:'github-actions'});} const r=await advanceProject(env,projectId); return json({advance:r,transport:env.COMPUTE_EXECUTOR==='hybrid'?'hybrid-worker':env.CDRS_QUEUE?'cloudflare-queue':'d1-fallback'}); }
+    if(parts[3]==='run' && method==='POST'){ await run(env.DB,`UPDATE projects SET reviewer_hold_marker=NULL WHERE id=?`,[projectId]); if(env.COMPUTE_EXECUTOR==='github-actions'){await enqueueOnce(env,projectId,'advance_project',{},98);return json({status:'queued',transport:'github-actions'});} const r=await advanceProject(env,projectId); const recovery=env.COMPUTE_EXECUTOR==='hybrid'?await recoverHybridStall(env,{reason:'manual_project_run'}):null; return json({advance:r,recovery,transport:env.COMPUTE_EXECUTOR==='hybrid'?'hybrid-self-heal':env.CDRS_QUEUE?'cloudflare-queue':'d1-fallback'}); }
     if(parts[3]==='sources' && method==='GET'){ return json({sources:await all(env.DB,`SELECT * FROM data_sources WHERE project_id=? ORDER BY created_at DESC`,[projectId])}); }
     if(parts[3]==='official-sources' && parts[4]==='status' && method==='GET'){ return json(await officialSourceStatus(env,projectId)); }
     if(parts[3]==='official-sources' && parts[4]==='enable' && method==='POST'){ const b=await bodyJson(request); const ids=Array.isArray(b.connector_ids)?b.connector_ids:[b.connector_id].filter(Boolean); const out=[]; for(const id of ids) out.push({connector_id:id,...await enableOfficialConnector(env,projectId,id,(b.configs||{})[id]||b.config||{})}); return json({enabled:out,status:await officialSourceStatus(env,projectId)},201); }
@@ -203,13 +231,14 @@ async function api(request,env){
 
   if(url.pathname==='/api/runner/status' && method==='GET') return json(await githubRunnerStatus(env));
   if(url.pathname==='/api/runner/dispatch' && method==='POST') return json(await dispatchGithubActionsIfNeeded(env,{force:false,reason:'manual_api'}));
+  if(url.pathname==='/api/runner/recover' && method==='POST') return json(await recoverHybridStall(env,{reason:'manual_recover'}));
 
   if(url.pathname==='/api/ai/test' && method==='GET'){
     const r=await aiJson(env,'You are a test assistant.','Say hello in Korean.',{ok:false},{schemaHint:'{"ok":true,"message":"string"}',maxTokens:100});
     return json({binding:!!env.AI,configured_model:env.AI_MODEL||null,result:r});
   }
   if(url.pathname==='/api/jobs/process' && method==='POST') return json({results:await processJobs(env)});
-  if(url.pathname==='/api/schedule' && method==='POST'){ const scheduled=await scheduleAll(env,{process:false}); const dispatch=env.COMPUTE_EXECUTOR==='hybrid'?await dispatchGithubActionsIfNeeded(env,{reason:'api_schedule'}):null; const fast=env.COMPUTE_EXECUTOR==='hybrid'?await processFastLane(env,{rounds:3}):await processJobs(env); return json({scheduled,dispatch,fast}); }
+  if(url.pathname==='/api/schedule' && method==='POST'){ const scheduled=await scheduleAll(env,{process:false}); const fast=env.COMPUTE_EXECUTOR==='hybrid'?await processFastLane(env,{rounds:3}):await processJobs(env); const recovery=env.COMPUTE_EXECUTOR==='hybrid'?await recoverHybridStall(env,{reason:'api_schedule'}):null; return json({scheduled,fast,recovery}); }
 
   if(url.pathname==='/api/studies' && method==='POST'){
     const b=await bodyJson(request), id=uid('study'); await run(env.DB,`INSERT INTO study_groups(id,name,created_at) VALUES(?,?,?)`,[id,b.name||'DCV Study',nowIso()]); return json({id},201);
@@ -227,13 +256,13 @@ async function api(request,env){
 export default {
   async fetch(request,env,ctx){
     const url=new URL(request.url);
-    if(url.pathname.startsWith('/api/')) return api(request,env);
+    if(url.pathname.startsWith('/api/')) return api(request,env,ctx);
     return env.ASSETS.fetch(request);
   },
-  async scheduled(controller,env,ctx){ ctx.waitUntil((async()=>{ await scheduleAll(env,{process:false}); await dispatchGithubActionsIfNeeded(env,{reason:'worker_cron'}); await processFastLane(env,{rounds:3}); await scheduleLab(env); })()); },
+  async scheduled(controller,env,ctx){ ctx.waitUntil((async()=>{ await scheduleAll(env,{process:false}); await processFastLane(env,{rounds:3}); await recoverHybridStall(env,{reason:'worker_cron'}); await scheduleLab(env); })()); },
   async queue(batch,env,ctx){
     for(const message of batch.messages){
-      try{ await processJobs(env); message.ack(); }
+      try{ const out=await processJobs(env); if(!out.length&&String(env.COMPUTE_EXECUTOR||'')==='hybrid')await recoverHybridStall(env,{reason:'queue_wake'}); message.ack(); }
       catch(e){ message.retry(); }
     }
   }
