@@ -25,8 +25,13 @@ export async function runActions(env,{seconds=210,maxJobs=36,maxCalls=420}={}){
   if(typeof env.DB.remaining!=='number'||env.DB.remaining>0){
    const result=await env.DB.batch([
     env.DB.prepare(`SELECT j.type,j.phase,j.status,COUNT(*) n FROM jobs j WHERE j.status IN ('queued','running','failed') GROUP BY j.type,j.phase,j.status`),
-    env.DB.prepare(`SELECT c.status,COUNT(*) n FROM design_candidates c JOIN projects p ON p.id=c.project_id WHERE c.research_cycle=p.research_cycle GROUP BY c.status`)
-   ]);progress={jobs:result[0].results||[],candidates:result[1].results||[]};
+    env.DB.prepare(`SELECT c.status,COUNT(*) n FROM design_candidates c JOIN projects p ON p.id=c.project_id WHERE c.research_cycle=p.research_cycle GROUP BY c.status`),
+    env.DB.prepare(`SELECT COUNT(*) n FROM design_candidates c JOIN projects p ON p.id=c.project_id
+      WHERE c.research_cycle=p.research_cycle AND c.status='pending'
+        AND NOT EXISTS(SELECT 1 FROM simulation_runs r WHERE r.candidate_id=c.id AND r.phase='exploration')
+        AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.project_id=c.project_id AND j.type='compute_candidate'
+          AND json_extract(j.payload_json,'$.candidate_id')=c.id AND j.status IN ('queued','running'))`)
+   ]);progress={jobs:result[0].results||[],candidates:result[1].results||[],stranded_candidates:Number(result[2].results?.[0]?.n||0)};
   }
   const pending=progress?.jobs.some(j=>j.status==='queued'||j.status==='running');
   return {status:failures?'completed_with_job_errors':env.RUNNER_BUDGET_DEFERRED?'budget_deferred':pending?'work_remaining':'completed',jobs:completed,failures,progress,d1_api_calls:env.DB.calls,elapsed_seconds:Math.round((Date.now()-started)/1000)};
