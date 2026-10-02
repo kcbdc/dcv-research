@@ -53,9 +53,15 @@ async function main(){
    const retryAfterRaw=r.headers.get('retry-after');
    const retryAfterSeconds=retryAfterRaw&&/^\d+(?:\.\d+)?$/.test(retryAfterRaw)?Number(retryAfterRaw):null;
    const retryAfterMs=retryAfterSeconds!=null?Math.ceil(retryAfterSeconds*1000):Math.min(1500*(2**attempt),6000);
-   const error=new Error(`Workers AI REST failed (${r.status})`);
-   error.status=r.status;error.code=r.status===429?'AI_RATE_LIMITED':'AI_REST_FAILED';error.retryAfterMs=retryAfterMs;
+   const cfErrors=[...(Array.isArray(j?.errors)?j.errors:[]),...(Array.isArray(j?.result?.errors)?j.result.errors:[])];
+   const cfCode=cfErrors.map(e=>Number(e?.code)).find(Number.isFinite);
+   const cfMessage=cfErrors.map(e=>String(e?.message||'')).filter(Boolean).join(' | ');
+   const contextExceeded=cfCode===5021||/context window|context.*limit|maximum.*tokens|exceeded.*tokens/i.test(cfMessage);
+   const error=new Error(contextExceeded?`Workers AI context limit exceeded (5021): ${cfMessage||'request exceeds model context window'}`:`Workers AI REST failed (${r.status})${cfMessage?`: ${cfMessage.slice(0,180)}`:''}`);
+   error.status=r.status;error.cfCode=cfCode;error.code=contextExceeded?'AI_CONTEXT_LIMIT':r.status===429?'AI_RATE_LIMITED':'AI_REST_FAILED';error.retryAfterMs=retryAfterMs;
    lastError=error;
+   // 5021은 요청 크기 문제라 재시도로 해결되지 않는다. 상위 aiJson이 규칙 기반 fallback으로 전환한다.
+   if(contextExceeded)throw error;
    // 429/5xx는 같은 모델에서만 제한적으로 재시도한다. 모델 전환으로 계정 단위 rate limit을 증폭하지 않는다.
    if(attempt<2&&(r.status===429||r.status>=500)){await sleep(Math.min(retryAfterMs,8000));continue;}
    throw error;
