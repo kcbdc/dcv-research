@@ -1,45 +1,129 @@
 name: Deploy Cloudflare Worker
+
 on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      apply_migrations:
+        description: 'D1 migrations 실행 여부'
+        required: false
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - yes
+          - no
+
+concurrency:
+  group: dcv-cloudflare-production
+  cancel-in-progress: false
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
           node-version: '24'
           cache: npm
-      - run: npm install
+
+      - name: Install dependencies
+        run: npm ci
+
       - name: Verify required migration files
         run: node scripts/verify-migrations.mjs
+
       - name: Unit tests
         run: node --test --test-reporter=spec tests/*.test.mjs
+
+      - name: Prepare reproducibility bundle
+        run: npm run predeploy
+
       - name: Verify pinned D1 binding
         run: npm run storage:verify
         env:
           DCV_EXPECTED_D1_DATABASE_ID: ${{ secrets.DCV_EXPECTED_D1_DATABASE_ID }}
+
+      - name: Decide whether D1 migrations are required
+        id: migrations
+        shell: bash
+        env:
+          MANUAL_CHOICE: ${{ github.event.inputs.apply_migrations || 'auto' }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            case "$MANUAL_CHOICE" in
+              yes) echo "run=true" >> "$GITHUB_OUTPUT"; exit 0 ;;
+              no)  echo "run=false" >> "$GITHUB_OUTPUT"; exit 0 ;;
+            esac
+          fi
+
+          BEFORE="${{ github.event.before }}"
+          AFTER="${{ github.sha }}"
+
+          # workflow_dispatch 또는 첫 커밋 등 before가 없으면 최근 1개 커밋만 비교
+          if [[ -z "$BEFORE" || "$BEFORE" == "0000000000000000000000000000000000000000" ]]; then
+            BEFORE="HEAD^"
+            AFTER="HEAD"
+          fi
+
+          CHANGED="$(git diff --name-only "$BEFORE" "$AFTER" 2>/dev/null || true)"
+          printf '%s\n' "$CHANGED"
+
+          if printf '%s\n' "$CHANGED" | grep -Eq '^(migrations/|wrangler\.jsonc$)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "D1-related files changed: remote migration guard will run."
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "No D1 migration/binding change: skipping remote D1 mutation checks."
+          fi
+
+      - name: Check Cloudflare deploy credentials
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          [[ -n "$CLOUDFLARE_API_TOKEN" ]] || { echo 'Missing secret: CLOUDFLARE_API_TOKEN'; exit 1; }
+          [[ -n "$CLOUDFLARE_ACCOUNT_ID" ]] || { echo 'Missing secret: CLOUDFLARE_ACCOUNT_ID'; exit 1; }
+          npx wrangler whoami
+
+      # D1 remote access is required only when the schema/binding actually changes.
+      # Prefer a dedicated D1 token with D1 Read/Write permission; fall back to the deploy token.
       - name: Snapshot project count before migration
+        if: steps.migrations.outputs.run == 'true'
         run: npm run storage:snapshot
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_D1_API_TOKEN || secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
       - name: Apply D1 migrations
+        if: steps.migrations.outputs.run == 'true'
         run: npx wrangler d1 migrations apply DB --remote
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_D1_API_TOKEN || secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
       - name: Verify project preservation after migration
+        if: steps.migrations.outputs.run == 'true'
         run: npm run storage:check
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_D1_API_TOKEN || secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      - name: Deploy
+
+      - name: Deploy Worker
         run: npx wrangler deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
