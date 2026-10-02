@@ -331,21 +331,34 @@ export async function computeCandidate(env,projectId,candidateId,phase='explorat
   const currentScope=await one(env.DB,`SELECT research_cycle,evidence_revision FROM projects WHERE id=?`,[projectId]);
   if(Number(currentScope?.research_cycle||1)!==projectCycle||Number(currentScope?.evidence_revision||0)!==projectRev)throw new Error('compute_scope_changed_during_run');
   const resultHash=saved?ev.result_hash:await sha256Hex(stableStringify({seed,phase,cycle,projectRev,raw:batch,metrics:m}));
-  await run(env.DB,`INSERT OR IGNORE INTO simulation_runs(id,project_id,candidate_id,phase,seed,n,loss_mean,loss_exceed_rate,fp_rate,fn_rate,review_burden,recovery_time,regret,result_json,created_at,evidence_revision) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,[id,projectId,candidateId,phase,seed,n,m.loss_mean,m.loss_exceed_rate,m.fp_rate,m.fn_rate,m.review_burden,m.recovery_time,null,JSON.stringify({...ev,result_hash:resultHash,raw:saved?ev.raw:batch,cycle,runner_code_revision:env.RUNNER_CODE_REVISION||null,engine_version:'DCV-CDRS-v3',confidence_method:config.confidence_method,candidate_role:c.candidate_role,reviewer_source:reviewer?'current_revision_human_model':'design_priors_unvalidated',estimator:c.estimator,reviewer_used:!!reviewer,scenario_source:scenarioPack.source,empirical_ready:scenarioPack.empirical_ready,empirical_episode_n:scenarioPack.episode_n,empirical_profile:cal.profile.version}),nowIso(),projectRev]);
-  await run(env.DB,`INSERT OR IGNORE INTO candidate_evidence(id,project_id,candidate_id,phase,cycle,classification,boundary_score,metrics_json,created_at) VALUES(?,?,?,?,?,?,?,?,?)`,[`evidence_${id}`,projectId,candidateId,phase,cycle,ev.classification,ev.boundary_score,JSON.stringify(ev),nowIso()]);
+  // Fast evaluation path: persist one candidate atomically in a single D1 batch.
+  // The numerical engine, deterministic seed and statistical thresholds are unchanged;
+  // only REST round-trips are reduced. This is especially important when >100 candidates
+  // are still UNEVALUATED on the GitHub Actions/D1 REST runner.
+  const writeTs=nowIso();
+  const resultJson=JSON.stringify({...ev,result_hash:resultHash,raw:saved?ev.raw:batch,cycle,runner_code_revision:env.RUNNER_CODE_REVISION||null,engine_version:'DCV-CDRS-v3',confidence_method:config.confidence_method,candidate_role:c.candidate_role,reviewer_source:reviewer?'current_revision_human_model':'design_priors_unvalidated',estimator:c.estimator,reviewer_used:!!reviewer,scenario_source:scenarioPack.source,empirical_ready:scenarioPack.empirical_ready,empirical_episode_n:scenarioPack.episode_n,empirical_profile:cal.profile.version});
+  const auditDetail=JSON.stringify({phase,cycle,classification:ev.classification,boundary_score:ev.boundary_score,metrics:m,seed,result_hash:resultHash,runner_code_revision:env.RUNNER_CODE_REVISION||null,scenario_source:scenarioPack.source,empirical_ready:scenarioPack.empirical_ready,empirical_profile:cal.profile.version});
+  const writes=[
+    env.DB.prepare(`INSERT OR IGNORE INTO simulation_runs(id,project_id,candidate_id,phase,seed,n,loss_mean,loss_exceed_rate,fp_rate,fn_rate,review_burden,recovery_time,regret,result_json,created_at,evidence_revision) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(id,projectId,candidateId,phase,seed,n,m.loss_mean,m.loss_exceed_rate,m.fp_rate,m.fn_rate,m.review_burden,m.recovery_time,null,resultJson,writeTs,projectRev),
+    env.DB.prepare(`INSERT OR IGNORE INTO candidate_evidence(id,project_id,candidate_id,phase,cycle,classification,boundary_score,metrics_json,created_at) VALUES(?,?,?,?,?,?,?,?,?)`).bind(`evidence_${id}`,projectId,candidateId,phase,cycle,ev.classification,ev.boundary_score,JSON.stringify(ev),writeTs)
+  ];
+  // Preserve the exact legacy state-transition semantics while combining writes.
   if(['exploration','refinement'].includes(phase)){
-    let status=ev.classification==='FEASIBLE'?'provisionally_feasible':ev.classification==='INFEASIBLE'?'infeasible':'unresolved';
-    await run(env.DB,`UPDATE design_candidates SET status=?,evidence_status=?,boundary_score=?,objective_score=?,updated_at=? WHERE id=?`,[status,ev.classification,ev.boundary_score,m.objective_score,nowIso(),candidateId]);
-    if(ev.classification==='UNRESOLVED'&&cycle<config.max_refinement)await enqueueComputeOnce(env,projectId,{candidate_id:candidateId,phase:'refinement',cycle:cycle+1},35-Math.min(10,Math.round(ev.boundary_score)));
-    else if(ev.classification==='UNRESOLVED') await run(env.DB,`UPDATE design_candidates SET status='boundary_hold',evidence_status='UNRESOLVED',boundary_score=?,updated_at=? WHERE id=?`,[ev.boundary_score,nowIso(),candidateId]);
-    if(ev.classification==='FEASIBLE')await enqueueComputeOnce(env,projectId,{candidate_id:candidateId,phase:'confirmation',cycle:0},45);
+    const candidateStatus=ev.classification==='FEASIBLE'?'provisionally_feasible':ev.classification==='INFEASIBLE'?'infeasible':cycle>=config.max_refinement?'boundary_hold':'unresolved';
+    writes.push(env.DB.prepare(`UPDATE design_candidates SET status=?,evidence_status=?,boundary_score=?,objective_score=?,updated_at=? WHERE id=?`).bind(candidateStatus,ev.classification,ev.boundary_score,m.objective_score,writeTs,candidateId));
   } else if(phase==='confirmation'){
-    if(ev.classification==='FEASIBLE')await run(env.DB,`UPDATE design_candidates SET status='confirmed_feasible',evidence_status='FEASIBLE',boundary_score=?,objective_score=?,updated_at=? WHERE id=?`,[ev.boundary_score,m.objective_score,nowIso(),candidateId]);
-    else if(ev.classification==='INFEASIBLE')await run(env.DB,`UPDATE design_candidates SET status='confirmation_failed',evidence_status='INFEASIBLE',updated_at=? WHERE id=?`,[nowIso(),candidateId]);
-    else if(cycle<config.max_confirmation)await enqueueComputeOnce(env,projectId,{candidate_id:candidateId,phase:'confirmation',cycle:cycle+1},42);
-    else await run(env.DB,`UPDATE design_candidates SET status='boundary_hold',evidence_status='UNRESOLVED',boundary_score=?,updated_at=? WHERE id=?`,[ev.boundary_score,nowIso(),candidateId]);
+    if(ev.classification==='FEASIBLE')writes.push(env.DB.prepare(`UPDATE design_candidates SET status='confirmed_feasible',evidence_status='FEASIBLE',boundary_score=?,objective_score=?,updated_at=? WHERE id=?`).bind(ev.boundary_score,m.objective_score,writeTs,candidateId));
+    else if(ev.classification==='INFEASIBLE')writes.push(env.DB.prepare(`UPDATE design_candidates SET status='confirmation_failed',evidence_status='INFEASIBLE',updated_at=? WHERE id=?`).bind(writeTs,candidateId));
+    else if(cycle>=config.max_confirmation)writes.push(env.DB.prepare(`UPDATE design_candidates SET status='boundary_hold',evidence_status='UNRESOLVED',boundary_score=?,updated_at=? WHERE id=?`).bind(ev.boundary_score,writeTs,candidateId));
   }
-  await audit(env,projectId,'agent','cdrs.run','candidate',candidateId,{phase,cycle,classification:ev.classification,boundary_score:ev.boundary_score,metrics:m,seed,result_hash:resultHash,runner_code_revision:env.RUNNER_CODE_REVISION||null,scenario_source:scenarioPack.source,empirical_ready:scenarioPack.empirical_ready,empirical_profile:cal.profile.version});
+  writes.push(env.DB.prepare(`INSERT INTO audit_log(id,project_id,actor,action,entity_type,entity_id,detail_json,created_at) VALUES(?,?,?,?,?,?,?,?)`).bind(uid('audit'),projectId,'agent','cdrs.run','candidate',candidateId,auditDetail,writeTs));
+  await env.DB.batch(writes);
+  if(['exploration','refinement'].includes(phase)){
+    if(ev.classification==='UNRESOLVED'&&cycle<config.max_refinement)await enqueueComputeOnce(env,projectId,{candidate_id:candidateId,phase:'refinement',cycle:cycle+1},35-Math.min(10,Math.round(ev.boundary_score)));
+    if(ev.classification==='FEASIBLE')await enqueueComputeOnce(env,projectId,{candidate_id:candidateId,phase:'confirmation',cycle:0},45);
+  } else if(phase==='confirmation'&&ev.classification==='UNRESOLVED'&&cycle<config.max_confirmation){
+    await enqueueComputeOnce(env,projectId,{candidate_id:candidateId,phase:'confirmation',cycle:cycle+1},42);
+  }
   return{id,phase,cycle,seed,classification:ev.classification,boundary_score:ev.boundary_score,...m};
 }
 export async function enqueueRobustValidation(env,projectId){
