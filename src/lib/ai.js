@@ -84,6 +84,9 @@ export async function aiJson(env, system, user, fallback, opts = {}) {
       errors.push(`${model}: JSON 파싱 실패`);
     } catch (e) {
       errors.push(`${model}: ${String(e?.message || e).slice(0, 200)}`);
+      // 429는 대개 계정/계정+모델 단위 제한이다. 즉시 다른 모델을 연속 호출하면
+      // 같은 제한 창에서 요청만 늘어나므로, REST 래퍼의 제한적 재시도 후 바로 규칙 기반으로 전환한다.
+      if (Number(e?.status) === 429 || e?.code === 'AI_RATE_LIMITED' || /\b429\b/.test(String(e?.message || ''))) break;
     }
   }
   return { ...fallback, _ai: { ok: false, error: errors.join(' | ') } };
