@@ -1,3 +1,14 @@
+## v0.7.3 — Hybrid Worker/Actions executor + persistent validation snapshots
+
+- Added a hybrid executor: Cloudflare Worker handles only lightweight orchestration (`advance_project`, `approve_project`); GitHub Actions handles simulation, validation, collection, reviewer fitting, recompute finalization, reporting and other heavy work.
+- Partitioned the durable D1 jobs queue by runtime lane so Worker and Actions cannot claim each other's jobs.
+- Added defense-in-depth guards preventing Monte Carlo and Research LAB work from running on the public Worker in hybrid mode.
+- Worker cron reduced from 15 minutes to 5 minutes so stage transitions resume without waiting for the next Actions run.
+- Manual project Run advances lightweight orchestration immediately in hybrid mode; report generation remains queued for Actions.
+- External Validation Matrix now falls back to the most recent valid snapshot when a new Evidence Revision is still revalidating, with explicit STALE/current revision metadata instead of showing NO DATA.
+- Dashboard shows `STALE rN → rM` and preserves the corresponding Funnel until the current revision replaces it.
+- Added regression tests for disjoint execution lanes, Worker heavy-compute blocking, and stale Matrix preservation.
+
 ## v0.5.21 — Live-load recovery + toolkit click fix + right-reference height sync + report figure restore
 
 - Fixed thesis-toolkit/module timing race by resolving `window.DCV` dynamically at click time; Word, MD+그림, 더보기 and 논문 도구 controls no longer retain an undefined core reference.
