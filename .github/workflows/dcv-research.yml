@@ -1,7 +1,7 @@
 name: DCV research compute
 on:
   schedule:
-    - cron: '3-51/12 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:
 permissions:
   contents: read
