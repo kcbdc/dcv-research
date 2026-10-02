@@ -5,7 +5,7 @@ import {createD1Rest} from './lib/d1-rest.mjs';
 import {acquireRunner,heartbeatRunner,releaseRunner} from './lib/actions-runtime.mjs';
 import {scheduleAll,processJobs} from '../src/lib/orchestrator.js';
 import {scheduleLab} from '../src/lib/lab.js';
-export async function runActions(env,{seconds=90,maxJobs=20,maxCalls=250}={}){
+export async function runActions(env,{seconds=210,maxJobs=36,maxCalls=420}={}){
  const token=await acquireRunner(env);if(!token)return {status:'runner_already_active',jobs:0};
  const started=Date.now();let completed=0,failures=0,primaryError=null;
  try{
@@ -38,9 +38,9 @@ async function main(){
  stage='validate_secrets';
  const credentials=runnerCredentials(process.env,cfg.d1_databases[0].database_id);
  const {accountId:CF_ACCOUNT_ID,aiToken:CF_AI_API_TOKEN}=credentials;
- const DB=createD1Rest(credentials);
+ const DB=createD1Rest({...credentials,intervalMs:Number(process.env.D1_REST_INTERVAL_MS||450),maxCalls:Number(process.env.D1_REST_MAX_CALLS||420)});
  stage='preflight_d1';await preflightD1(DB);console.log('D1 preflight OK: connection and required tables verified.');
- const env={...cfg.vars,DB,COMPUTE_EXECUTOR:'hybrid',EXTERNAL_RUNTIME:'github-actions',MAX_JOBS_PER_TICK:'1',RUNNER_CODE_REVISION:process.env.GITHUB_SHA||'local',ECOS_API_KEY:process.env.ECOS_API_KEY,OPENFISCAL_API_KEY:process.env.OPENFISCAL_API_KEY,BOJO_API_KEY:process.env.BOJO_API_KEY,FDIC_API_KEY:process.env.FDIC_API_KEY};
+ const env={...cfg.vars,DB,COMPUTE_EXECUTOR:'hybrid',EXTERNAL_RUNTIME:'github-actions',MAX_JOBS_PER_TICK:String(process.env.MAX_JOBS_PER_TICK||4),RUNNER_CODE_REVISION:process.env.GITHUB_SHA||'local',ECOS_API_KEY:process.env.ECOS_API_KEY,OPENFISCAL_API_KEY:process.env.OPENFISCAL_API_KEY,BOJO_API_KEY:process.env.BOJO_API_KEY,FDIC_API_KEY:process.env.FDIC_API_KEY};
  env.RUNNER_JOB_OBSERVER=(type,stage,error)=>console.log(JSON.stringify({stage,job_type:type,d1_api_calls:DB.calls,...(error?{diagnostic:safeDiagnostic(error)}:{})}));
  if(CF_AI_API_TOKEN)env.AI={run:async(model,input)=>{
   const url=`https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/run/${model}`;
