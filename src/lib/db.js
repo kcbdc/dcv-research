@@ -10,12 +10,26 @@ export async function audit(env, projectId, actor, action, entityType=null, enti
 }
 
 const MAX_QUEUE_DELAY = 43200;   // Cloudflare Queues delaySeconds 상한(12시간)
+
+// Hybrid executor lanes. Keep the Worker lane deliberately small because the Free plan
+// has a tight CPU budget; heavy statistical work remains on GitHub Actions.
+export const WORKER_LIGHT_JOB_TYPES = Object.freeze(['advance_project','approve_project']);
+const WORKER_LIGHT_SET = new Set(WORKER_LIGHT_JOB_TYPES);
+export function jobExecutionLane(type){ return WORKER_LIGHT_SET.has(String(type)) ? 'worker-light' : 'github-heavy'; }
+function runtimeLane(env){
+  const mode=String(env.COMPUTE_EXECUTOR||'cloudflare');
+  if(mode==='hybrid') return env.EXTERNAL_RUNTIME==='github-actions'?'github-heavy':'worker-light';
+  if(mode==='github-actions') return env.EXTERNAL_RUNTIME==='github-actions'?'all':'none';
+  return 'all';
+}
 async function sendWake(env, bodies, delaySeconds=0) {
   if (env.COMPUTE_EXECUTOR==='github-actions' || !env.CDRS_QUEUE || !bodies.length) return;
+  const wakeBodies=env.COMPUTE_EXECUTOR==='hybrid'?bodies.filter(b=>jobExecutionLane(b.type)==='worker-light'):bodies;
+  if(!wakeBodies.length)return;
   const opts = delaySeconds > 0 ? { delaySeconds: Math.min(MAX_QUEUE_DELAY, Math.ceil(delaySeconds)) } : undefined;
   try {
-    if (bodies.length === 1) await env.CDRS_QUEUE.send(bodies[0], opts);
-    else for (let i=0;i<bodies.length;i+=100) await env.CDRS_QUEUE.sendBatch(bodies.slice(i,i+100).map(body=>({body})), opts);
+    if (wakeBodies.length === 1) await env.CDRS_QUEUE.send(wakeBodies[0], opts);
+    else for (let i=0;i<wakeBodies.length;i+=100) await env.CDRS_QUEUE.sendBatch(wakeBodies.slice(i,i+100).map(body=>({body})), opts);
   } catch (_) {}
 }
 
@@ -70,9 +84,12 @@ export async function enqueueMany(env, projectId, type, payloads=[], priority=10
 
 export async function claimJobs(env, limit=4) {
   await recoverStaleJobs(env);
+  const lane=runtimeLane(env); if(lane==='none')return [];
   const remaining=env.EXTERNAL_RUNTIME==='github-actions'&&typeof env.DB.remaining==='number'?env.DB.remaining:1000000;
-  // An oversized collector must not block smaller compute jobs behind it.
-  const jobs = await all(env.DB, `SELECT * FROM jobs WHERE status='queued' AND run_after<=?
+  const laneSql=lane==='worker-light'?` AND type IN ('advance_project','approve_project')`:lane==='github-heavy'?` AND type NOT IN ('advance_project','approve_project')`:'';
+  // An oversized collector must not block smaller compute jobs behind it. In hybrid mode,
+  // the same indexed queue is partitioned by job type so Worker and Actions never steal each other's work.
+  const jobs = await all(env.DB, `SELECT * FROM jobs WHERE status='queued' AND run_after<=?${laneSql}
     AND CASE type WHEN 'collect_project' THEN 180 WHEN 'generate_report' THEN 100 WHEN 'advance_project' THEN 90 ELSE 60 END<=?
     ORDER BY priority ASC, created_at ASC LIMIT ?`, [nowIso(), remaining, limit]);
   if(!jobs.length&&remaining<180){const waiting=await one(env.DB,`SELECT 1 x FROM jobs WHERE status='queued' AND run_after<=? LIMIT 1`,[nowIso()]);if(waiting)env.RUNNER_BUDGET_DEFERRED=true;}
@@ -112,7 +129,9 @@ export async function pruneJobs(env, days=3) {
 // 인덱스(idx_jobs_claim) 순서로 최대 limit 행만 읽으므로 Cron 1회당 읽기는 많아야 limit 행.
 export async function wakeDueJobs(env, limit=10) {
   if (!env.CDRS_QUEUE) return 0;
-  const rows = await all(env.DB, `SELECT id,project_id,type FROM jobs WHERE status='queued' AND run_after<=? ORDER BY priority ASC, created_at ASC LIMIT ?`, [nowIso(), limit]);
+  const lane=runtimeLane(env); if(lane==='none'||lane==='github-heavy')return 0;
+  const laneSql=lane==='worker-light'?` AND type IN ('advance_project','approve_project')`:'';
+  const rows = await all(env.DB, `SELECT id,project_id,type FROM jobs WHERE status='queued' AND run_after<=?${laneSql} ORDER BY priority ASC, created_at ASC LIMIT ?`, [nowIso(), limit]);
   await sendWake(env, rows.map(r=>({ job_id:r.id, project_id:r.project_id, type:r.type })));
   return rows.length;
 }

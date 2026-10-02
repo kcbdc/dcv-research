@@ -129,7 +129,7 @@ async function completeTaskFailure(env,c,t,token,message){
 }
 
 export async function scheduleLab(env){
- if(env.COMPUTE_EXECUTOR==='github-actions'&&env.EXTERNAL_RUNTIME!=='github-actions')return {status:'waiting_for_github_actions'};
+ if(['github-actions','hybrid'].includes(env.COMPUTE_EXECUTOR)&&env.EXTERNAL_RUNTIME!=='github-actions')return {status:'waiting_for_github_actions'};
  // Missing migration must not break the pre-existing DCV pipeline.
  try{
   if(env.LAB_AUTO_START==='true'&&Date.now()<Date.parse(env.LAB_DEADLINE_AT||DEFAULT_DEADLINE)){

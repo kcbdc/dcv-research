@@ -43,12 +43,20 @@ export async function refreshValidationMatrix(env,projectId){
   for(let i=0;i<stmts.length;i+=50)await env.DB.batch(stmts.slice(i,i+50));
   return {rows:cands.length,pass,fail,hold,partial,cycle,revision:rev};
 }
+async function matrixRows(env,projectId,cycle,rev){
+  return all(env.DB,`SELECT m.*,c.estimator,c.sigma,c.alpha,c.authority_k,c.delay_d,c.max_regret,c.status candidate_status FROM candidate_validation_matrix m JOIN design_candidates c ON c.id=m.candidate_id WHERE m.project_id=? AND m.research_cycle=? AND m.evidence_revision=? ORDER BY CASE m.overall_status WHEN 'PASS' THEN 1 WHEN 'PARTIAL' THEN 2 WHEN 'HOLD' THEN 3 WHEN 'FAIL' THEN 4 ELSE 5 END, COALESCE(c.max_regret,999999),c.authority_k DESC,c.sigma`,[projectId,cycle,rev]);
+}
 export async function getValidationMatrix(env,projectId){
   const p=await one(env.DB,`SELECT name,research_cycle,evidence_revision FROM projects WHERE id=?`,[projectId]);if(!p)throw new Error('project_not_found');
-  const cycle=Number(p.research_cycle||1),rev=Number(p.evidence_revision||0);
-  const rows=await all(env.DB,`SELECT m.*,c.estimator,c.sigma,c.alpha,c.authority_k,c.delay_d,c.max_regret,c.status candidate_status FROM candidate_validation_matrix m JOIN design_candidates c ON c.id=m.candidate_id WHERE m.project_id=? AND m.research_cycle=? AND m.evidence_revision=? ORDER BY CASE m.overall_status WHEN 'PASS' THEN 1 WHEN 'PARTIAL' THEN 2 WHEN 'HOLD' THEN 3 WHEN 'FAIL' THEN 4 ELSE 5 END, COALESCE(c.max_regret,999999),c.authority_k DESC,c.sigma`,[projectId,cycle,rev]);
+  const currentCycle=Number(p.research_cycle||1),currentRev=Number(p.evidence_revision||0);
+  let cycle=currentCycle,rev=currentRev,rows=await matrixRows(env,projectId,cycle,rev),stale=false,snapshotUpdatedAt=null;
+  if(!rows.length){
+    const snap=await one(env.DB,`SELECT research_cycle,evidence_revision,MAX(updated_at) updated_at FROM candidate_validation_matrix WHERE project_id=? AND (research_cycle<? OR (research_cycle=? AND evidence_revision<?)) GROUP BY research_cycle,evidence_revision ORDER BY research_cycle DESC,evidence_revision DESC LIMIT 1`,[projectId,currentCycle,currentCycle,currentRev]);
+    if(snap){ cycle=Number(snap.research_cycle||1);rev=Number(snap.evidence_revision||0);snapshotUpdatedAt=snap.updated_at||null;rows=await matrixRows(env,projectId,cycle,rev);stale=rows.length>0; }
+  }
+  if(!snapshotUpdatedAt&&rows.length)snapshotUpdatedAt=rows.reduce((m,r)=>String(r.updated_at||'')>String(m||'')?r.updated_at:m,null);
   const summary={total:rows.length,PASS:0,PARTIAL:0,HOLD:0,FAIL:0,NA:0,dimensions:{}};
   for(const k of DIMS)summary.dimensions[k]={PASS:0,HOLD:0,FAIL:0,NA:0};
   for(const r of rows){summary[r.overall_status]=(summary[r.overall_status]||0)+1;for(const k of DIMS){const s=r[k.toLowerCase()+'_status']||'NA';summary.dimensions[k][s]=(summary.dimensions[k][s]||0)+1;}}
-  return {project_id:projectId,project_name:p.name||projectId,cycle,revision:rev,generated_at:nowIso(),basis:'CURRENT_PROJECT_ONLY',dimensions:DIMS,summary,rows:rows.map(r=>({...r,detail:safeJson(r.detail_json,{})}))};
+  return {project_id:projectId,project_name:p.name||projectId,cycle,revision:rev,current_cycle:currentCycle,current_revision:currentRev,stale,stale_reason:stale?'CURRENT_REVISION_REVALIDATION_PENDING':null,snapshot_updated_at:snapshotUpdatedAt,served_at:nowIso(),generated_at:snapshotUpdatedAt||nowIso(),basis:stale?'LAST_KNOWN_VALID_SNAPSHOT':'CURRENT_PROJECT_ONLY',dimensions:DIMS,summary,rows:rows.map(r=>({...r,detail:safeJson(r.detail_json,{})}))};
 }
