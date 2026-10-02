@@ -24,6 +24,8 @@ async function jobExists(env,projectId,type,phase=null){
 
 // 모든 자동 단계를 마친 프로젝트 상태. 이 상태에서는 Cron 이 15분마다 advance 를 돌려도 읽을 것이 없다.
 const TERMINAL_STATUSES = new Set(['complete','report_ready']);
+const INITIAL_CHECKPOINT_EVALUATED = 100;
+const FOLLOWUP_COMPUTE_BATCH = 20;
 
 async function setStage(env,p,stage){
   if(p.current_stage===stage) return;   // 같은 값이면 쓰기 생략
@@ -60,8 +62,8 @@ export async function advanceProject(env,projectId){
     const ph=String(busy.phase||''); const stage=busy.type==='compute_candidate'?(ph==='historical'||ph==='stress'?'validate':ph==='recompute'?'recompute':'compute'):busy.type==='validate_project'?'validate':'recompute';
     await setStage(env,p,stage); return {stage,waiting:'jobs_in_flight',job_type:busy.type,phase:ph||null};
   }
-  const cand=await one(env.DB,`SELECT COUNT(*) total,SUM(CASE WHEN status='confirmed_feasible' THEN 1 ELSE 0 END) feasible,SUM(CASE WHEN status IN ('pending','unresolved','provisionally_feasible') THEN 1 ELSE 0 END) active FROM design_candidates WHERE project_id=? AND research_cycle=?`,[projectId,cycle]);
-  const total=Number(cand?.total||0), feasible=Number(cand?.feasible||0), active=Number(cand?.active||0);
+  const cand=await one(env.DB,`SELECT COUNT(*) total,SUM(CASE WHEN status='confirmed_feasible' THEN 1 ELSE 0 END) feasible,SUM(CASE WHEN status IN ('pending','unresolved','provisionally_feasible') THEN 1 ELSE 0 END) active,SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) pending FROM design_candidates WHERE project_id=? AND research_cycle=?`,[projectId,cycle]);
+  const total=Number(cand?.total||0), feasible=Number(cand?.feasible||0), active=Number(cand?.active||0), pending=Number(cand?.pending||0), evaluated=Math.max(0,total-pending);
   if(!total){
     const inFlight=await one(env.DB,`SELECT COUNT(*) n FROM jobs WHERE project_id=? AND type IN ('seed_empirical_panel','define_project','collect_project','refit_empirical','measure_project','seed_candidates') AND status IN ('queued','running')`,[projectId]);
     if(Number(inFlight?.n||0)>0){ await setStage(env,p,'measure'); return {stage:'waiting',reason:'setup_jobs_in_flight'}; }
@@ -74,6 +76,24 @@ export async function advanceProject(env,projectId){
 
   // active 후보가 남아 있으면 아직 탐색 중이므로 'unfinished' 작업 조회 없이 바로 반환(조회 1회 절약)
   if(active>0){
+    // Partial-progress checkpoint: do not hold the whole research/report pipeline for the last
+    // unevaluated candidates. Once 100 candidates have a non-pending decision, write an interim
+    // report snapshot first. Thereafter compute only 20 new pending candidates, then refresh the
+    // interim report again. Final validation/approval still runs only after the candidate search
+    // itself is complete, so this accelerates visibility without weakening final gates.
+    if(total>INITIAL_CHECKPOINT_EVALUATED && pending>0 && evaluated>=INITIAL_CHECKPOINT_EVALUATED){
+      const latestCheckpoint=await one(env.DB,`SELECT CAST(json_extract(data_json,'$.summary.evaluated_candidates') AS INTEGER) n
+        FROM reports WHERE project_id=? AND research_cycle=? AND evidence_revision=? AND stale_at IS NULL
+          AND kind='paper_summary_checkpoint' ORDER BY created_at DESC LIMIT 1`,[projectId,cycle,rev]);
+      const last=Number(latestCheckpoint?.n||0);
+      const checkpointDue=last<INITIAL_CHECKPOINT_EVALUATED || evaluated>=last+FOLLOWUP_COMPUTE_BATCH || pending===0;
+      if(checkpointDue){
+        const queuedReport=await enqueueOnce(env,projectId,'generate_report',{checkpoint:true,evaluated_candidates:evaluated,pending_candidates:pending},38);
+        await setStage(env,p,'report');
+        return {stage:'checkpoint_report',evaluated,pending,total,queued_report:!!queuedReport,next_batch:FOLLOWUP_COMPUTE_BATCH};
+      }
+    }
+
     // v0.7.6 exhausted-job recovery:
     // 이전 구현은 같은 후보의 compute_candidate 실패 이력이 3건 이상이면 그 후보를 영구히 제외했다.
     // 버그/인프라 장애를 수정해 새 코드를 배포해도 design_candidates.status='pending'은 그대로라
@@ -100,7 +120,7 @@ export async function advanceProject(env,projectId){
             AND f2.status='failed' AND json_extract(f2.payload_json,'$.candidate_id')=c.id
             AND COALESCE(json_extract(f2.payload_json,'$.phase'),'exploration')='exploration'
             ORDER BY f2.updated_at DESC,f2.created_at DESC LIMIT 1)
-        LIMIT 100
+        LIMIT 20
       )`,[recoveryTs,recoveryTs,recoveryRevision,projectId,cycle,recoveryRevision]);
     const recoveredCount=Number(recovered?.meta?.changes||0);
 
@@ -112,11 +132,11 @@ export async function advanceProject(env,projectId){
       AND NOT EXISTS(SELECT 1 FROM jobs f WHERE f.project_id=c.project_id AND f.type='compute_candidate'
         AND json_extract(f.payload_json,'$.candidate_id')=c.id AND f.status='failed'
         AND json_extract(f.payload_json,'$._recovery_revision')=?)
-      LIMIT 100`,[projectId,cycle,recoveryRevision]);
+      LIMIT 20`,[projectId,cycle,recoveryRevision]);
     if(recoveredCount||missing.length)await ensureFrozenProtocol(env,projectId);
     const queued=await enqueueMany(env,projectId,'compute_candidate',missing.map(c=>({candidate_id:c.id,phase:'exploration',cycle:0})),40);
     await setStage(env,p,'compute');
-    return {stage:'cdrs_boundary_search',active,recovered:recoveredCount,queued,total,waiting:(recoveredCount||queued)?'recovered_exhausted_or_missing_jobs':'current_revision_failures_require_inspection'};
+    return {stage:'cdrs_boundary_search',active,pending,evaluated,recovered:recoveredCount,queued,total,batch_size:FOLLOWUP_COMPUTE_BATCH,waiting:recoveredCount?'recovered_exhausted_or_missing_jobs':queued?'processing_next_20_candidate_batch':'current_revision_failures_require_inspection'};
   }
   const unfinished=await jobExists(env,projectId,'compute_candidate','exploration')||await jobExists(env,projectId,'compute_candidate','refinement')||await jobExists(env,projectId,'compute_candidate','confirmation');
   if(unfinished){ await setStage(env,p,'compute'); return {stage:'cdrs_boundary_search',active,queued:1,total}; }
@@ -179,7 +199,7 @@ export async function advanceProject(env,projectId){
     return {stage:'approve'};
   }
 
-  const report=await one(env.DB,`SELECT id FROM reports WHERE project_id=? AND research_cycle=? AND evidence_revision=? AND stale_at IS NULL ORDER BY created_at DESC LIMIT 1`,[projectId,cycle,rev]);
+  const report=await one(env.DB,`SELECT id FROM reports WHERE project_id=? AND research_cycle=? AND evidence_revision=? AND stale_at IS NULL AND kind='paper_summary' ORDER BY created_at DESC LIMIT 1`,[projectId,cycle,rev]);
   if(!report){
     if(!(await jobExists(env,projectId,'generate_report'))) await enqueue(env,projectId,'generate_report',{},95);
     await setStage(env,p,'report');
@@ -208,7 +228,7 @@ async function execute(env,job){
     case 'recompute_project': return enqueueRecompute(env,id);
     case 'finalize_recompute': { const r=await finalizeRecompute(env,id); await enqueueOnce(env,id,'advance_project',{},98,5); return r; }
     case 'approve_project': return approveProject(env,id);
-    case 'generate_report': return generateReport(env,id);
+    case 'generate_report': { const r=await generateReport(env,id,{checkpoint:!!payload.checkpoint}); if(payload.checkpoint) await enqueueOnce(env,id,'advance_project',{},98,1); return r; }
     case 'compare_study': return compareStudy(env,payload.study_id);
     default: throw new Error(`unknown_job:${job.type}`);
   }
@@ -243,6 +263,17 @@ export async function scheduleAll(env,{process=true}={}){
   await run(env.DB,`UPDATE jobs SET priority=90,updated_at=? WHERE type='advance_project' AND status='queued' AND priority<90
     AND EXISTS(SELECT 1 FROM projects p JOIN design_candidates c ON c.project_id=p.id AND c.research_cycle=p.research_cycle
       WHERE p.id=jobs.project_id AND c.status='pending')`,[new Date().toISOString()]);
+  // Deployment-safe batching: older builds may already have queued up to 100 exploration jobs.
+  // Keep only the oldest 20 queued exploration jobs per project; candidates behind them remain
+  // pending and will be re-enqueued by advanceProject after the next checkpoint report.
+  await run(env.DB,`DELETE FROM jobs WHERE id IN (
+    SELECT id FROM (
+      SELECT j.id,ROW_NUMBER() OVER(PARTITION BY j.project_id ORDER BY j.created_at,j.id) rn
+      FROM jobs j JOIN projects p ON p.id=j.project_id
+      WHERE j.type='compute_candidate' AND j.status='queued' AND COALESCE(j.phase,json_extract(j.payload_json,'$.phase'),'exploration')='exploration'
+        AND EXISTS(SELECT 1 FROM design_candidates c WHERE c.project_id=j.project_id AND c.research_cycle=p.research_cycle AND c.status='pending')
+    ) WHERE rn>20
+  )`);
   // 완료된 프로젝트는 대상에서 제외(이전: 모든 auto_run 프로젝트에 15분마다 advance + 데이터소스 집계)
   // Two indexed EXISTS probes inside ONE bounded set query replace N per-project reads.
   const ps=await all(env.DB,`SELECT p.id,

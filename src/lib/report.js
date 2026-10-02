@@ -137,7 +137,7 @@ export function buildMarkdown(t, ai, sourceNote) {
   return L.join('\n');
 }
 
-export async function generateReport(env, projectId) {
+export async function generateReport(env, projectId, {checkpoint=false}={}) {
   const t = await buildThesisData(env, projectId), base = fallbackNarrative(t);
   base.limitations = [...(rvLimit(t)), '시뮬레이션 기반 결과이며 실제 제도 환경으로의 일반화에는 추가 검증이 필요하다.'];
   const ai = await aiJson(env,
@@ -151,13 +151,20 @@ export async function generateReport(env, projectId) {
   const proj=await one(env.DB,`SELECT research_cycle,evidence_revision FROM projects WHERE id=?`,[projectId]);
   const snapshotCycle=Number(t.project.research_cycle||1),snapshotRevision=Number(t.project.evidence_revision||0);
   const scopeChanged=Number(proj?.research_cycle||1)!==snapshotCycle||Number(proj?.evidence_revision||0)!==snapshotRevision;
-  await run(env.DB, `INSERT INTO reports(id,project_id,kind,title,content_markdown,data_json,created_at,research_cycle,evidence_revision) VALUES(?,?,?,?,?,?,?,?,?)`, [id, projectId, 'paper_summary', `${p?.name || 'DCV'} 연구결과`, md, JSON.stringify({ ai_meta: ai._ai, narrative: merged, checklist: checklist(t), figures: figureCatalog(t), summary: { decision: t.approval?.decision, candidates: t.candidates.total, confirmed: t.candidates.by_class.confirmed, reviewer_n: t.reviewer.n } }), nowIso(),snapshotCycle,snapshotRevision]);
+  const evaluatedCandidates=Math.max(0,Number(t.candidates.total||0)-Number(t.candidates.by_class.unevaluated||0));
+  const reportKind=checkpoint?'paper_summary_checkpoint':'paper_summary';
+  const reportTitle=checkpoint?`${p?.name || 'DCV'} 연구결과 · 중간 업데이트 (${evaluatedCandidates}/${t.candidates.total})`:`${p?.name || 'DCV'} 연구결과`;
+  await run(env.DB, `INSERT INTO reports(id,project_id,kind,title,content_markdown,data_json,created_at,research_cycle,evidence_revision) VALUES(?,?,?,?,?,?,?,?,?)`, [id, projectId, reportKind, reportTitle, md, JSON.stringify({ ai_meta: ai._ai, narrative: merged, checklist: checklist(t), figures: figureCatalog(t), summary: { decision: t.approval?.decision, candidates: t.candidates.total, evaluated_candidates:evaluatedCandidates, unevaluated_candidates:Number(t.candidates.by_class.unevaluated||0), confirmed: t.candidates.by_class.confirmed, reviewer_n: t.reviewer.n, checkpoint } }), nowIso(),snapshotCycle,snapshotRevision]);
   if(scopeChanged){await run(env.DB,`UPDATE reports SET stale_at=? WHERE id=?`,[nowIso(),id]);return {id,draft:true,stale:true,content_markdown:md,markdown:md};}
   const incomplete=(t.candidates.by_class.unevaluated||0)>0 || !t.candidates.total || !['COMPUTATIONALLY_CONFIRMED','SCIENTIFICALLY_APPROVED'].includes(t.approval?.decision);
   const signed=await one(env.DB, `SELECT id FROM approvals WHERE project_id=? AND research_cycle=? AND evidence_revision=? AND stale_at IS NULL AND decision='SCIENTIFICALLY_APPROVED' ORDER BY created_at DESC LIMIT 1`, [projectId,Number(proj?.research_cycle||1),Number(proj?.evidence_revision||0)]);
-  await run(env.DB, `UPDATE projects SET current_stage=?,status=?,updated_at=? WHERE id=?`, [incomplete?'compute':signed?'complete':'scientific_review',incomplete?'running':signed?'complete':'report_ready',nowIso(), projectId]);
-  await audit(env, projectId, 'agent', 'report.generated', 'report', id, { approval: t.approval?.decision, ai: ai._ai });
-  return { id, draft:incomplete, markdown: md, content_markdown: md, thesis: t, ai };
+  if(checkpoint){
+    await run(env.DB, `UPDATE projects SET current_stage='compute',status='running',updated_at=? WHERE id=?`, [nowIso(),projectId]);
+  }else{
+    await run(env.DB, `UPDATE projects SET current_stage=?,status=?,updated_at=? WHERE id=?`, [incomplete?'compute':signed?'complete':'scientific_review',incomplete?'running':signed?'complete':'report_ready',nowIso(), projectId]);
+  }
+  await audit(env, projectId, 'agent', checkpoint?'report.checkpoint.generated':'report.generated', 'report', id, { approval: t.approval?.decision, ai: ai._ai, evaluated_candidates:evaluatedCandidates, checkpoint });
+  return { id, draft:checkpoint||incomplete, checkpoint, evaluated_candidates:evaluatedCandidates, markdown: md, content_markdown: md, thesis: t, ai };
 }
 
 function rvLimit(t) {
