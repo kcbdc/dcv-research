@@ -164,6 +164,14 @@ export async function advanceProject(env,projectId){
     return {stage:'validate'};
   }
 
+  // Never advance to human fitting when G3 has no confirmed robust candidate.
+  // Older builds could fit a reviewer model directly from HUMAN_TRIAL evidence and display
+  // G4 PASS while G3 was WAIT; G5 then had zero candidates to recompute and stalled.
+  if(robustConfirmed===0){
+    await setStage(env,p,'validate');
+    return {stage:'hold',reason:'no_robust_confirmed_candidates',gate:'G3'};
+  }
+
   const reviewer=await one(env.DB,`SELECT id FROM reviewer_models WHERE project_id=? AND research_cycle=? AND evidence_revision=? ORDER BY version DESC LIMIT 1`,[projectId,cycle,rev]);
   if(!reviewer){
     // 이전: 표본 게이트(참가자 30명, 정답/오답 각 60건)를 통과할 때까지 fit_reviewer ↔ advance_project 가
@@ -225,7 +233,7 @@ async function execute(env,job){
     case 'advance_project': return advanceProject(env,id);
     case 'validate_project': { const r=await validateProject(env,id); await enqueueOnce(env,id,'advance_project',{},98,5); return r; }
     case 'fit_reviewer': return fitReviewerModel(env,id);   // HOLD 시 자기 재예약(900초 폴링) 제거: 새 관측이 오면 API 가 advance 를 깨운다
-    case 'recompute_project': return enqueueRecompute(env,id);
+    case 'recompute_project': { const r=await enqueueRecompute(env,id); if(Number(r?.queued||0)===0) await enqueueOnce(env,id,'advance_project',{},98,1); return r; }
     case 'finalize_recompute': { const r=await finalizeRecompute(env,id); await enqueueOnce(env,id,'advance_project',{},98,5); return r; }
     case 'approve_project': return approveProject(env,id);
     case 'generate_report': { const r=await generateReport(env,id,{checkpoint:!!payload.checkpoint}); if(payload.checkpoint) await enqueueOnce(env,id,'advance_project',{},98,1); return r; }

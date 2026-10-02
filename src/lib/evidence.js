@@ -31,7 +31,10 @@ export async function registerEvidence(env,projectId,{kind,impact_from=null,sour
   const fullCycle=!!started && (force_new_cycle||['define','measure','compute'].includes(impact));
   const nextRevision=Number(p.evidence_revision||0)+1,nextCycle=Number(p.research_cycle||1)+(fullCycle?1:0),ts=nowIso();
   if(fullCycle) await snapshot(env,p,`${kind}:${impact}`,nextRevision,nextCycle);
-  const from=earlierStage(earlierStage(p.current_stage||impact,p.revalidation_from||impact),impact);
+  // Use the pipeline's *current* progress plus the new impact. Do not keep an old
+  // revalidation_from forever: once DEFINE/MEASURE/COMPUTE have already been replayed, a new
+  // human observation should reopen VALIDATE onward, not rewind the project to DEFINE again.
+  const from=earlierStage(p.current_stage||impact,impact);
   await env.DB.batch([
     ...(config_update?[env.DB.prepare('UPDATE project_config SET design_json=?,benchmark_json=?,validation_json=? WHERE project_id=?').bind(JSON.stringify(config_update.design),JSON.stringify(config_update.benchmark),JSON.stringify(config_update.validation),projectId)]:[]),
     env.DB.prepare(`UPDATE projects SET evidence_revision=?,research_cycle=?,revalidation_from=?,approval_stale=1,last_evidence_at=?,status='revalidating',current_stage=?,reviewer_hold_marker=NULL,candidate_count=CASE WHEN ? THEN 0 ELSE candidate_count END,updated_at=? WHERE id=?`).bind(nextRevision,nextCycle,from,ts,from,fullCycle?1:0,ts,projectId),
@@ -42,9 +45,13 @@ export async function registerEvidence(env,projectId,{kind,impact_from=null,sour
   if(fullCycle){
     await run(env.DB,`UPDATE jobs SET status='failed',last_error='superseded_by_evidence_revision',updated_at=? WHERE project_id=? AND status IN ('queued','running') AND type IN ('seed_candidates','compute_candidate','validate_project','fit_reviewer','recompute_project','finalize_recompute','approve_project','generate_report')`,[ts,projectId]);
   }
-  // Human evidence reuses robust computation, but reviewer model + recompute must be refreshed.
-  if(impact==='validate' && String(kind||'').toUpperCase()==='REVERIFICATION_REVIEW') await enqueueOnce(env,projectId,'validate_project',{},58,1);
-  else if(impact==='validate') await enqueueOnce(env,projectId,'fit_reviewer',{},60,1);
+  // Validation-layer evidence must resume through the orchestrator rather than jumping
+  // directly to G4.  The old path enqueued fit_reviewer for every HUMAN_TRIAL even when
+  // current-cycle G3 robust validation was stale/incomplete, which could produce the
+  // impossible UI state G3=WAIT, G4=PASS and leave G5 with no robust candidates to recompute.
+  // advance_project enforces G1 -> G2 -> G3 -> G4 -> G5 ordering and coalesces bursts of
+  // human observations into one downstream refresh.
+  if(impact==='validate') await enqueueOnce(env,projectId,'advance_project',{},58,1);
   else if(impact==='measure') await enqueueOnce(env,projectId,'measure_project',{},30,1);
   else if(impact==='compute') await enqueueOnce(env,projectId,'seed_candidates',{},35,1);
   else await enqueueOnce(env,projectId,'define_project',{},10,1);
@@ -62,13 +69,35 @@ export async function approvalGates(env,projectId){
   const reviewer=await one(env.DB,`SELECT 1 x FROM reviewer_models WHERE project_id=? AND research_cycle=? AND evidence_revision=? LIMIT 1`,[projectId,cycle,rev]);
   const recompute=await one(env.DB,`SELECT 1 x FROM validations v JOIN design_candidates c ON c.id=v.candidate_id WHERE v.project_id=? AND c.research_cycle=? AND v.evidence_revision=? AND v.validation_type='human_recompute' AND v.status='CONFIRM' LIMIT 1`,[projectId,cycle,rev]);
   const signoff=await one(env.DB,`SELECT 1 x FROM approvals WHERE project_id=? AND research_cycle=? AND evidence_revision=? AND decision='SCIENTIFICALLY_APPROVED' AND stale_at IS NULL LIMIT 1`,[projectId,cycle,rev]);
+
+  // Gate status is dependency-ordered.  Persisted downstream artifacts may still exist from a
+  // prior/stale path, but they cannot make a later gate PASS while a prerequisite gate is WAIT.
+  const g1=!!protocol;
+  const g2=g1&&!!compute;
+  const g3=g2&&!!robust;
+  const g4=g3&&!!reviewer;
+  const g5=g4&&!!recompute;
+  const g6=g5&&!!signoff;
   const gates=[
-    {id:'G1',name:'Protocol Frozen',status:protocol?'PASS':'WAIT'},
-    {id:'G2',name:'Compute Confirmed',status:compute?'PASS':'WAIT'},
-    {id:'G3',name:'Robust Validation',status:robust?'PASS':'WAIT'},
-    {id:'G4',name:'Human Validation',status:reviewer?'PASS':'WAIT'},
-    {id:'G5',name:'Recompute Confirmed',status:recompute?'PASS':'WAIT'},
-    {id:'G6',name:'Scientific Sign-off',status:signoff?'PASS':'WAIT'}
+    {id:'G1',name:'Protocol Frozen',status:g1?'PASS':'WAIT'},
+    {id:'G2',name:'Compute Confirmed',status:g2?'PASS':'WAIT'},
+    {id:'G3',name:'Robust Validation',status:g3?'PASS':'WAIT'},
+    {id:'G4',name:'Human Validation',status:g4?'PASS':'WAIT'},
+    {id:'G5',name:'Recompute Confirmed',status:g5?'PASS':'WAIT'},
+    {id:'G6',name:'Scientific Sign-off',status:g6?'PASS':'WAIT'}
   ];
-  return{research_cycle:cycle,evidence_revision:rev,stale:!!p.approval_stale,revalidation_from:p.revalidation_from,gates,passed:gates.filter(g=>g.status==='PASS').length,total:gates.length};
+
+  // For the UI, report the next unresolved checkpoint rather than a stale historical origin.
+  // This prevents messages such as "DEFINE부터 재검증" after G1/G2 have already passed.
+  let revalidationFrom=null;
+  if(p.approval_stale){
+    if(!g1) revalidationFrom='define';
+    else if(!g2) revalidationFrom='compute';
+    else if(!g3) revalidationFrom='validate';
+    else if(!g4) revalidationFrom='validate';
+    else if(!g5) revalidationFrom='recompute';
+    else if(!g6) revalidationFrom='approved';
+  }
+  return{research_cycle:cycle,evidence_revision:rev,stale:!!p.approval_stale,revalidation_from:revalidationFrom,gates,passed:gates.filter(g=>g.status==='PASS').length,total:gates.length};
 }
+
