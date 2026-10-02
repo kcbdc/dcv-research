@@ -20,4 +20,4 @@ export async function sha256Hex(value){
   return [...new Uint8Array(out)].map(b=>b.toString(16).padStart(2,'0')).join('');
 }
 
-export const APP_VERSION = '0.7.5';
+export const APP_VERSION = '0.7.7';

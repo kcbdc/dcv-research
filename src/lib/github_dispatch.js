@@ -38,15 +38,20 @@ export async function githubRunnerStatus(env){
   };
 }
 
-export async function dispatchGithubActionsIfNeeded(env,{force=false,reason='heavy_queue'}={}){
+export async function dispatchGithubActionsIfNeeded(env,{force=false,reason='heavy_queue',heavyHint=false}={}){
   if(String(env.COMPUTE_EXECUTOR||'')!=='hybrid') return {status:'not_hybrid'};
   if(env.EXTERNAL_RUNTIME==='github-actions') return {status:'already_in_github_actions'};
   const c=cfg(env);
   if(!(c.token&&c.owner&&c.repo&&c.workflow&&c.ref)) return {status:'not_configured'};
   const now=nowIso();
   if(!force){
-    const heavy=await first(env,`SELECT COUNT(*) n,MIN(created_at) oldest FROM jobs WHERE status='queued' AND run_after<=? AND type NOT IN (${HEAVY_EXCLUSION_SQL})`,[now]);
-    if(Number(heavy?.n||0)===0) return {status:'no_heavy_work'};
+    // An enqueue event is authoritative: the heavy job was just durably inserted.
+    // Avoid an immediate read-after-write re-query here; Node/D1 adapters and remote
+    // replicas can make that redundant check flaky. Cron/API callers still query D1.
+    if(!heavyHint){
+      const heavy=await first(env,`SELECT COUNT(*) n,MIN(created_at) oldest FROM jobs WHERE status='queued' AND run_after<=? AND type NOT IN (${HEAVY_EXCLUSION_SQL})`,[now]);
+      if(Number(heavy?.n||0)===0) return {status:'no_heavy_work'};
+    }
     const active=await first(env,`SELECT lease_until FROM external_runner_leases WHERE id=?`,[RUNNER_LEASE_ID]);
     if(active?.lease_until&&active.lease_until>now) return {status:'runner_active',lease_until:active.lease_until};
   }

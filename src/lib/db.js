@@ -1,4 +1,5 @@
 import { nowIso, uid } from './util.js';
+import { dispatchGithubActionsIfNeeded } from './github_dispatch.js';
 
 export async function one(db, sql, binds = []) { return db.prepare(sql).bind(...binds).first(); }
 export async function all(db, sql, binds = []) { const r = await db.prepare(sql).bind(...binds).all(); return r.results || []; }
@@ -38,7 +39,15 @@ function laneSqlFor(lane){
   return '';
 }
 async function sendWake(env, bodies, delaySeconds=0) {
-  if (env.COMPUTE_EXECUTOR==='github-actions' || !env.CDRS_QUEUE || !bodies.length) return;
+  if (!bodies.length) return;
+  // Hybrid heavy jobs wake GitHub immediately. GitHub cron remains only a fallback.
+  // Cooldown + active-runner lease inside the dispatcher prevents dispatch storms.
+  if(env.COMPUTE_EXECUTOR==='hybrid' && env.EXTERNAL_RUNTIME!=='github-actions' && delaySeconds<=0 && bodies.some(b=>jobExecutionLane(b.type)==='github-heavy')){
+    // Successful enqueue is itself proof that due heavy work exists; pass a hint so
+    // the dispatcher does not perform a redundant read-after-write queue query.
+    try{ await dispatchGithubActionsIfNeeded(env,{reason:'heavy_job_enqueued',heavyHint:true}); }catch(_){}
+  }
+  if (env.COMPUTE_EXECUTOR==='github-actions' || !env.CDRS_QUEUE) return;
   const wakeBodies=env.COMPUTE_EXECUTOR==='hybrid'?bodies.filter(b=>jobExecutionLane(b.type)!=='github-heavy'):bodies;
   if(!wakeBodies.length)return;
   const opts = delaySeconds > 0 ? { delaySeconds: Math.min(MAX_QUEUE_DELAY, Math.ceil(delaySeconds)) } : undefined;

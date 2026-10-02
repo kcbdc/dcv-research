@@ -1,5 +1,14 @@
 # v0.7.6 — Event-driven GitHub heavy runner
 
+## v0.7.7 — Event-dispatch CI reliability fix
+
+- Heavy-job enqueue now passes an authoritative `heavyHint` to the GitHub dispatcher instead of immediately re-querying D1 after the durable INSERT.
+- Runner-active and dispatch-cooldown leases are still enforced, so burst coalescing and duplicate-run protection are unchanged.
+- Cron/manual dispatch paths still query D1 for due heavy work.
+- Delayed heavy jobs do not dispatch early; the Worker cron wakes them when due.
+- Fixes the Node 24 CI failure where `hybrid heavy enqueue event-dispatches GitHub once...` could observe zero mock dispatch calls.
+
+
 - Cloudflare Worker now dispatches `dcv-research.yml` immediately when a GitHub-heavy job is enqueued.
 - Worker 1-minute Cron also checks existing heavy D1 backlog and dispatches Actions, so stranded pre-deployment jobs recover automatically.
 - D1 `external_runner_leases` provides a 180-second dispatch cooldown and active-runner detection to avoid dispatch storms.

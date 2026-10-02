@@ -88,6 +88,15 @@ test('hybrid heavy enqueue event-dispatches GitHub once and cooldown coalesces b
   assert.ok(state?.lease_until);
 });
 
+test('delayed hybrid heavy enqueue does not dispatch GitHub before it is due',async()=>{
+  const DB=makeDb(),id=await seedProject(DB,{candidates:1,reviewer:0,episodes:0});
+  DB.raw.exec('DELETE FROM jobs');
+  let calls=0;
+  const env={DB,COMPUTE_EXECUTOR:'hybrid',GITHUB_ACTIONS_TOKEN:'secret-token',GITHUB_OWNER:'kcbcdc',GITHUB_REPO:'dcv-research-platform',GITHUB_FETCH:async()=>{calls++;return new Response(null,{status:204});}};
+  await enqueue(env,id,'compute_candidate',{candidate_id:'cand_0',phase:'exploration',cycle:0},40,60);
+  assert.equal(calls,0);
+});
+
 test('hybrid worker-fast enqueue does not dispatch GitHub',async()=>{
   const DB=makeDb(),id=await seedProject(DB,{candidates:1,reviewer:0,episodes:0});
   DB.raw.exec('DELETE FROM jobs');
