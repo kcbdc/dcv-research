@@ -118,3 +118,35 @@ test('runner status exposes configuration and queue health without exposing toke
   assert.equal('token' in status,false);
   assert.doesNotMatch(JSON.stringify(status),/do-not-leak/);
 });
+
+
+test('hybrid emergency lane claims only one queued compute candidate',async()=>{
+  const DB=makeDb(),id=await seedProject(DB,{candidates:2,reviewer:0,episodes:0});
+  DB.raw.exec('DELETE FROM jobs');
+  await enqueue({DB,COMPUTE_EXECUTOR:'hybrid'},id,'compute_candidate',{candidate_id:'cand_0',phase:'exploration',cycle:0},40);
+  await enqueue({DB,COMPUTE_EXECUTOR:'hybrid'},id,'compute_candidate',{candidate_id:'cand_1',phase:'exploration',cycle:0},40);
+  const jobs=await claimJobs({DB,COMPUTE_EXECUTOR:'hybrid',EMERGENCY_WORKER_COMPUTE:'1'},4);
+  assert.equal(jobs.length,1);
+  assert.equal(jobs[0].type,'compute_candidate');
+  assert.equal(DB.raw.prepare("SELECT COUNT(*) n FROM jobs WHERE status='queued' AND type='compute_candidate'").get().n,1);
+});
+
+test('compute guard opens only for explicit emergency worker fallback',async()=>{
+  const env={DB:{prepare(){return {bind(){return {first:async()=>null}}}}},COMPUTE_EXECUTOR:'hybrid',EMERGENCY_WORKER_COMPUTE:'1'};
+  await assert.rejects(computeCandidate(env,'p','missing'),/candidate_not_found/);
+});
+
+
+test('stalled queued zero-attempt heavy job is self-healed when GitHub dispatch is unavailable',async()=>{
+  const {recoverHybridStall}=await import('../src/index.js');
+  const DB=makeDb(),id=await seedProject(DB,{candidates:1,reviewer:0,episodes:0});
+  DB.raw.exec('DELETE FROM jobs');
+  DB.raw.prepare("UPDATE design_candidates SET status='pending' WHERE id='cand_0'").run();
+  await enqueue({DB,COMPUTE_EXECUTOR:'hybrid'},id,'compute_candidate',{candidate_id:'cand_0',phase:'exploration',cycle:0},40);
+  DB.raw.prepare("UPDATE jobs SET created_at='2000-01-01T00:00:00.000Z',run_after='2000-01-01T00:00:00.000Z',updated_at='2000-01-01T00:00:00.000Z',attempts=0 WHERE type='compute_candidate'").run();
+  const out=await recoverHybridStall({DB,COMPUTE_EXECUTOR:'hybrid'},{reason:'test_stall'});
+  assert.equal(out.status,'worker_emergency');
+  const row=DB.raw.prepare("SELECT attempts,status FROM jobs WHERE type='compute_candidate' ORDER BY created_at LIMIT 1").get();
+  assert.equal(row.attempts,1);
+  assert.notEqual(row.status,'running');
+});
