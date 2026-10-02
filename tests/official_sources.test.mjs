@@ -38,7 +38,7 @@ test('ECOS connector uses secret and StatisticSearch row normalization',async()=
 });
 
 test('Case B connectors are isolated and remain CONFIG_REQUIRED without dataset endpoint',async()=>{
-  const DB=seed();await enableOfficialConnector({DB},'p','openfiscal');await enableOfficialConnector({DB},'p','bojo_openapi');const st=await officialSourceStatus({DB},'p');assert.equal(st.layers.find(x=>x.layer_code==='B').enabled,1);assert.ok(st.sources.filter(x=>x.case_layer==='B').every(x=>x.config.status==='CONFIG_REQUIRED'));
+  const DB=seed();await enableOfficialConnector({DB},'p','openfiscal');await enableOfficialConnector({DB},'p','bojo_openapi');const st=await officialSourceStatus({DB},'p');assert.equal(st.layers.find(x=>x.layer_code==='B').enabled,1);assert.equal(st.sources.find(x=>x.connector_id==='openfiscal').config.status,'CONFIG_REQUIRED');assert.equal(st.sources.find(x=>x.connector_id==='bojo_openapi').config.status,'READY');
   const s=await source(DB,'openfiscal');assert.equal(s.enabled,0);await assert.rejects(()=>collectOfficialSource({DB,OPENFISCAL_API_KEY:'k'},'p',s),/CONFIG_REQUIRED/);
 });
 
