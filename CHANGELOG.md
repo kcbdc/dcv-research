@@ -1,3 +1,13 @@
+## v0.7.4 — Aggressive Hybrid Fast Path
+
+- Expanded Cloudflare Worker fast-path to `measure_project` and `seed_candidates`.
+- Added shared-fast transitions (`advance_project`, `recompute_project`, `finalize_recompute`, `approve_project`) claimable by either Worker or GitHub, with D1 atomic claim preventing duplicate execution.
+- Worker scheduled orchestration now runs up to three fast-path rounds per event so newly queued transition work can progress without waiting for another long interval.
+- Worker Cron increased from every 5 minutes to every minute; GitHub heavy compute schedule increased from 12-minute cadence to 5-minute cadence.
+- GitHub Actions can consume shared transition jobs immediately after heavy compute, avoiding an extra Worker-Cron wait.
+- Dashboard now labels recent jobs as WORKER FAST / SHARED FAST / GITHUB HEAVY and displays HYBRID FAST in the research briefing.
+- Heavy simulation, validation, reviewer fitting, empirical refit, external collection and report generation remain on GitHub Actions.
+
 ## v0.7.3 — Hybrid Worker/Actions executor + persistent validation snapshots
 
 - Added a hybrid executor: Cloudflare Worker handles only lightweight orchestration (`advance_project`, `approve_project`); GitHub Actions handles simulation, validation, collection, reviewer fitting, recompute finalization, reporting and other heavy work.

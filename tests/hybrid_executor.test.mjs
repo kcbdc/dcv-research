@@ -7,22 +7,32 @@ import {processJobs} from '../src/lib/orchestrator.js';
 import {computeCandidate} from '../src/lib/compute.js';
 import {scheduleLab} from '../src/lib/lab.js';
 
-test('hybrid lane classification keeps only lightweight orchestration on Worker',()=>{
-  assert.equal(jobExecutionLane('advance_project'),'worker-light');
-  assert.equal(jobExecutionLane('approve_project'),'worker-light');
-  for(const t of ['compute_candidate','validate_project','fit_reviewer','recompute_project','finalize_recompute','collect_project','generate_report','refit_empirical']) assert.equal(jobExecutionLane(t),'github-heavy');
+test('hybrid lane classification uses aggressive Worker fast path and shared transitions',()=>{
+  assert.equal(jobExecutionLane('measure_project'),'worker-fast');
+  assert.equal(jobExecutionLane('seed_candidates'),'worker-fast');
+  for(const t of ['advance_project','recompute_project','finalize_recompute','approve_project']) assert.equal(jobExecutionLane(t),'shared-fast');
+  for(const t of ['compute_candidate','validate_project','fit_reviewer','collect_project','generate_report','refit_empirical','define_project']) assert.equal(jobExecutionLane(t),'github-heavy');
 });
 
-test('hybrid Worker and GitHub runner claim disjoint job types',async()=>{
+test('hybrid Worker claims worker-fast/shared but leaves heavy compute for GitHub',async()=>{
   const DB=makeDb(),id=await seedProject(DB,{candidates:1,reviewer:0,episodes:0});
   DB.raw.exec('DELETE FROM jobs');
+  await enqueue({DB,COMPUTE_EXECUTOR:'hybrid'},id,'measure_project',{},8);
   await enqueue({DB,COMPUTE_EXECUTOR:'hybrid'},id,'advance_project',{},10);
   await enqueue({DB,COMPUTE_EXECUTOR:'hybrid'},id,'compute_candidate',{candidate_id:'cand_0',phase:'exploration',cycle:0},20);
   const worker=await claimJobs({DB,COMPUTE_EXECUTOR:'hybrid'},4);
-  assert.deepEqual(worker.map(x=>x.type),['advance_project']);
-  await finishJob({DB,COMPUTE_EXECUTOR:'hybrid'},worker[0]);
+  assert.deepEqual(worker.map(x=>x.type),['measure_project','advance_project']);
+  for(const j of worker)await finishJob({DB,COMPUTE_EXECUTOR:'hybrid'},j);
   const github=await claimJobs({DB,COMPUTE_EXECUTOR:'hybrid',EXTERNAL_RUNTIME:'github-actions'},4);
   assert.deepEqual(github.map(x=>x.type),['compute_candidate']);
+});
+
+test('shared-fast transition can be claimed by GitHub immediately after heavy compute',async()=>{
+  const DB=makeDb(),id=await seedProject(DB,{candidates:1,reviewer:0,episodes:0});
+  DB.raw.exec('DELETE FROM jobs');
+  await enqueue({DB,COMPUTE_EXECUTOR:'hybrid'},id,'advance_project',{},10);
+  const github=await claimJobs({DB,COMPUTE_EXECUTOR:'hybrid',EXTERNAL_RUNTIME:'github-actions'},4);
+  assert.deepEqual(github.map(x=>x.type),['advance_project']);
 });
 
 test('hybrid public Worker cannot run heavy compute or LAB directly',async()=>{
@@ -31,7 +41,7 @@ test('hybrid public Worker cannot run heavy compute or LAB directly',async()=>{
   assert.equal((await scheduleLab(env)).status,'waiting_for_github_actions');
 });
 
-test('hybrid processJobs on Worker leaves heavy queued work untouched',async()=>{
+test('hybrid processJobs on Worker leaves heavy compute queued',async()=>{
   const DB=makeDb(),id=await seedProject(DB,{candidates:1,reviewer:0,episodes:0});
   DB.raw.exec('DELETE FROM jobs');
   await enqueue({DB,COMPUTE_EXECUTOR:'hybrid'},id,'compute_candidate',{candidate_id:'cand_0',phase:'exploration',cycle:0},20);

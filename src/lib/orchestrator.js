@@ -186,6 +186,20 @@ export async function processJobs(env){
   return results;
 }
 
+export async function processFastLane(env,{rounds=3}={}){
+  const out=[];
+  // Worker fast-path intentionally runs a short chain in one scheduled/request event.
+  // Newly-enqueued heavy jobs remain queued for GitHub; shared transition jobs can be
+  // consumed immediately by whichever runtime is already active.
+  for(let i=0;i<Math.max(1,Math.min(4,Number(rounds)||1));i++){
+    const batch=await processJobs(env);
+    if(!Array.isArray(batch)||!batch.length)break;
+    out.push(...batch);
+    if(batch.some(x=>x?.ok===false))break;
+  }
+  return out;
+}
+
 export async function scheduleAll(env,{process=true}={}){
   if(env.COMPUTE_EXECUTOR==='github-actions'&&env.EXTERNAL_RUNTIME!=='github-actions')return {transport:'github-actions',status:'waiting_for_runner'};
   // 완료된 프로젝트는 대상에서 제외(이전: 모든 auto_run 프로젝트에 15분마다 advance + 데이터소스 집계)
@@ -216,5 +230,5 @@ export async function scheduleAll(env,{process=true}={}){
   // 끝난 job 정리는 하루 4회(UTC 0/6/12/18시 첫 Cron)만 — 전용 인덱스를 두면 매 job 상태 변경마다 쓰기가 늘어난다.
   { const t=new Date(); if(t.getUTCHours()%6===0 && t.getUTCMinutes()<15){ try{ await pruneJobs(env); }catch(_){} } }
   if(env.CDRS_QUEUE){ const woke=await wakeDueJobs(env); return {scheduled:ps.length,woke,transport:'cloudflare-queue'}; }
-  return process?processJobs(env):{scheduled:ps.length,transport:'github-actions'};
+  return process?processJobs(env):{scheduled:ps.length,transport:env.COMPUTE_EXECUTOR==='hybrid'?'hybrid-fast-path':'github-actions'};
 }

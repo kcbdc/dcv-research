@@ -4,7 +4,7 @@ import { json, nowIso, uid, safeJson } from './lib/util.js';
 import { requireAdmin } from './lib/auth.js';
 import { all, one, run, enqueue, enqueueOnce, audit } from './lib/db.js';
 import { bust } from './lib/memo.js';
-import { processJobs, scheduleAll, advanceProject } from './lib/orchestrator.js';
+import { processJobs, processFastLane, scheduleAll, advanceProject } from './lib/orchestrator.js';
 import { generateReport, upgradeStoredReport } from './lib/report.js';
 import { buildThesisData, exportCsv, EXPORT_NAMES } from './lib/thesis.js';
 import { aiJson } from './lib/ai.js';
@@ -200,7 +200,7 @@ async function api(request,env){
     return json({binding:!!env.AI,configured_model:env.AI_MODEL||null,result:r});
   }
   if(url.pathname==='/api/jobs/process' && method==='POST') return json({results:await processJobs(env)});
-  if(url.pathname==='/api/schedule' && method==='POST') return json({results:await scheduleAll(env)});
+  if(url.pathname==='/api/schedule' && method==='POST'){ const scheduled=await scheduleAll(env,{process:false}); const fast=env.COMPUTE_EXECUTOR==='hybrid'?await processFastLane(env,{rounds:3}):await processJobs(env); return json({scheduled,fast}); }
 
   if(url.pathname==='/api/studies' && method==='POST'){
     const b=await bodyJson(request), id=uid('study'); await run(env.DB,`INSERT INTO study_groups(id,name,created_at) VALUES(?,?,?)`,[id,b.name||'DCV Study',nowIso()]); return json({id},201);
@@ -221,7 +221,7 @@ export default {
     if(url.pathname.startsWith('/api/')) return api(request,env);
     return env.ASSETS.fetch(request);
   },
-  async scheduled(controller,env,ctx){ ctx.waitUntil(Promise.allSettled([scheduleAll(env),scheduleLab(env)])); },
+  async scheduled(controller,env,ctx){ ctx.waitUntil((async()=>{ await scheduleAll(env,{process:false}); await processFastLane(env,{rounds:3}); await scheduleLab(env); })()); },
   async queue(batch,env,ctx){
     for(const message of batch.messages){
       try{ await processJobs(env); message.ack(); }

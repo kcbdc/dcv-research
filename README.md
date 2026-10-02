@@ -238,3 +238,7 @@ Browser reloads use no-store API reads, dashboard cards synchronize to the rende
 
 ### v0.5.21 live-load / interaction recovery
 Initial project data retries automatically, thesis/report controls resolve the DCV core dynamically, desktop cards synchronize to the right-side rendered reference height, and report figures hydrate independently with fallback rendering.
+
+
+## v0.7.4 Aggressive Hybrid Fast Path
+Cloudflare Worker now handles measure/seed and short state-transition chains every minute; heavy simulation/validation/collection/report jobs remain on GitHub Actions. Shared transition jobs can be claimed by either runtime, so a running Actions job can continue directly into the next gate instead of waiting for the next Worker Cron. The dashboard labels each recent job as WORKER FAST, SHARED FAST, or GITHUB HEAVY.

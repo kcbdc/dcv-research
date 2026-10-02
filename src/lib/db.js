@@ -11,20 +11,35 @@ export async function audit(env, projectId, actor, action, entityType=null, enti
 
 const MAX_QUEUE_DELAY = 43200;   // Cloudflare Queues delaySeconds 상한(12시간)
 
-// Hybrid executor lanes. Keep the Worker lane deliberately small because the Free plan
-// has a tight CPU budget; heavy statistical work remains on GitHub Actions.
-export const WORKER_LIGHT_JOB_TYPES = Object.freeze(['advance_project','approve_project']);
-const WORKER_LIGHT_SET = new Set(WORKER_LIGHT_JOB_TYPES);
-export function jobExecutionLane(type){ return WORKER_LIGHT_SET.has(String(type)) ? 'worker-light' : 'github-heavy'; }
+// Hybrid executor lanes. v0.7.4 uses an aggressive fast-path: D1/state orchestration
+// runs on Worker, heavy statistical/network work remains on GitHub Actions. Shared-fast
+// transition jobs may be claimed by either runtime; the atomic status update prevents duplicates.
+export const WORKER_FAST_JOB_TYPES = Object.freeze(['measure_project','seed_candidates']);
+export const SHARED_FAST_JOB_TYPES = Object.freeze(['advance_project','recompute_project','finalize_recompute','approve_project']);
+const WORKER_FAST_SET = new Set(WORKER_FAST_JOB_TYPES);
+const SHARED_FAST_SET = new Set(SHARED_FAST_JOB_TYPES);
+export function jobExecutionLane(type){
+  const t=String(type);
+  if(WORKER_FAST_SET.has(t)) return 'worker-fast';
+  if(SHARED_FAST_SET.has(t)) return 'shared-fast';
+  return 'github-heavy';
+}
 function runtimeLane(env){
   const mode=String(env.COMPUTE_EXECUTOR||'cloudflare');
-  if(mode==='hybrid') return env.EXTERNAL_RUNTIME==='github-actions'?'github-heavy':'worker-light';
+  if(mode==='hybrid') return env.EXTERNAL_RUNTIME==='github-actions'?'github-hybrid':'worker-hybrid';
   if(mode==='github-actions') return env.EXTERNAL_RUNTIME==='github-actions'?'all':'none';
   return 'all';
 }
+function laneSqlFor(lane){
+  const workerOnly=WORKER_FAST_JOB_TYPES.map(x=>`'${x}'`).join(',');
+  const shared=SHARED_FAST_JOB_TYPES.map(x=>`'${x}'`).join(',');
+  if(lane==='worker-hybrid') return ` AND type IN (${workerOnly},${shared})`;
+  if(lane==='github-hybrid') return ` AND type NOT IN (${workerOnly})`;
+  return '';
+}
 async function sendWake(env, bodies, delaySeconds=0) {
   if (env.COMPUTE_EXECUTOR==='github-actions' || !env.CDRS_QUEUE || !bodies.length) return;
-  const wakeBodies=env.COMPUTE_EXECUTOR==='hybrid'?bodies.filter(b=>jobExecutionLane(b.type)==='worker-light'):bodies;
+  const wakeBodies=env.COMPUTE_EXECUTOR==='hybrid'?bodies.filter(b=>jobExecutionLane(b.type)!=='github-heavy'):bodies;
   if(!wakeBodies.length)return;
   const opts = delaySeconds > 0 ? { delaySeconds: Math.min(MAX_QUEUE_DELAY, Math.ceil(delaySeconds)) } : undefined;
   try {
@@ -86,7 +101,7 @@ export async function claimJobs(env, limit=4) {
   await recoverStaleJobs(env);
   const lane=runtimeLane(env); if(lane==='none')return [];
   const remaining=env.EXTERNAL_RUNTIME==='github-actions'&&typeof env.DB.remaining==='number'?env.DB.remaining:1000000;
-  const laneSql=lane==='worker-light'?` AND type IN ('advance_project','approve_project')`:lane==='github-heavy'?` AND type NOT IN ('advance_project','approve_project')`:'';
+  const laneSql=laneSqlFor(lane);
   // An oversized collector must not block smaller compute jobs behind it. In hybrid mode,
   // the same indexed queue is partitioned by job type so Worker and Actions never steal each other's work.
   const jobs = await all(env.DB, `SELECT * FROM jobs WHERE status='queued' AND run_after<=?${laneSql}
@@ -129,8 +144,8 @@ export async function pruneJobs(env, days=3) {
 // 인덱스(idx_jobs_claim) 순서로 최대 limit 행만 읽으므로 Cron 1회당 읽기는 많아야 limit 행.
 export async function wakeDueJobs(env, limit=10) {
   if (!env.CDRS_QUEUE) return 0;
-  const lane=runtimeLane(env); if(lane==='none'||lane==='github-heavy')return 0;
-  const laneSql=lane==='worker-light'?` AND type IN ('advance_project','approve_project')`:'';
+  const lane=runtimeLane(env); if(lane==='none'||lane==='github-hybrid')return 0;
+  const laneSql=laneSqlFor(lane);
   const rows = await all(env.DB, `SELECT id,project_id,type FROM jobs WHERE status='queued' AND run_after<=?${laneSql} ORDER BY priority ASC, created_at ASC LIMIT ?`, [nowIso(), limit]);
   await sendWake(env, rows.map(r=>({ job_id:r.id, project_id:r.project_id, type:r.type })));
   return rows.length;
