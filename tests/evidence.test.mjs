@@ -27,7 +27,7 @@ test('one new human trial invalidates prior approval but does not restart comput
   const p=env.DB.raw.prepare(`SELECT * FROM projects WHERE id='p'`).get();
   assert.equal(p.current_stage,'validate'); assert.equal(p.approval_stale,1); assert.equal(p.research_cycle,1);
   const a=env.DB.raw.prepare(`SELECT stale_at FROM approvals WHERE id='a'`).get(); assert.ok(a.stale_at);
-  const j=env.DB.raw.prepare(`SELECT type FROM jobs WHERE project_id='p' AND status='queued'`).all().map(x=>x.type); assert.ok(j.includes('fit_reviewer'));
+  const j=env.DB.raw.prepare(`SELECT type FROM jobs WHERE project_id='p' AND status='queued'`).all().map(x=>x.type); assert.ok(j.includes('advance_project')); assert.ok(!j.includes('fit_reviewer'));
 });
 
 test('new external data after computation opens a new research cycle from Measure',async()=>{
@@ -40,11 +40,18 @@ test('new external data after computation opens a new research cycle from Measur
   const snap=env.DB.raw.prepare(`SELECT COUNT(*) n FROM evidence_snapshots WHERE project_id='p'`).get(); assert.equal(snap.n,1);
 });
 
-test('approval gates count only current evidence revision',async()=>{
+test('approval gates are dependency ordered and current-revision evidence cannot skip G3',async()=>{
   const env=await base();
-  const g=await approvalGates(env,'p'); assert.equal(g.total,6); assert.equal(g.passed,2); // compute + prior scientific sign-off on current evidence
+  // The fixture has a feasible candidate and an old sign-off, but no frozen protocol/robust/reviewer chain.
+  // Downstream artifacts must not make later gates PASS out of order.
+  const g=await approvalGates(env,'p');
+  assert.equal(g.total,6); assert.equal(g.passed,0);
+  assert.deepEqual(g.gates.map(x=>x.status),['WAIT','WAIT','WAIT','WAIT','WAIT','WAIT']);
   await registerEvidence(env,'p',{kind:'HUMAN_TRIAL'});
-  const g2=await approvalGates(env,'p'); assert.equal(g2.evidence_revision,1); assert.equal(g2.gates.at(-1).status,'WAIT');
+  const g2=await approvalGates(env,'p');
+  assert.equal(g2.evidence_revision,1);
+  assert.equal(g2.gates.find(x=>x.id==='G4').status,'WAIT');
+  assert.equal(g2.gates.find(x=>x.id==='G5').status,'WAIT');
 });
 
 
