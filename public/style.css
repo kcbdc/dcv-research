@@ -721,3 +721,4 @@ body{background:var(--cw-bg)!important;color:var(--cw-ink)!important;overflow-x:
   #computeSection #regionBadge{position:absolute;right:0;bottom:14px;white-space:nowrap}
   #computeSection .fig-quick .btn-ghost{padding:6px 10px!important}
 }
+.matrix-stale-banner{grid-column:1/-1;padding:10px 12px;margin:0 0 8px;border:1px solid #f0c36a;background:#fff8e8;color:#7a5300;border-radius:8px;font-size:.78rem;line-height:1.45}
