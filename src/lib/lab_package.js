@@ -1,34 +1,35 @@
 import {buildDocx} from '../../public/docx.js';
 import {labZip,labBarPng} from './lab_archive.js';
 import {REPLICATION_CODE} from './lab_code_bundle.js';
-import {MANUSCRIPT_SECTIONS,journalAssessment} from './lab_policy.js';
+import {MANUSCRIPT_SECTIONS,labGateState,DEFAULT_TARGET_JOURNAL} from './lab_policy.js';
 import {nowIso,sha256Hex,safeJson} from './util.js';
 
 const label={abstract:'Abstract',introduction:'Introduction',related_work:'Related literature',methods:'Methods',results:'Results',discussion:'Discussion',conclusion:'Conclusion'};
 const table=(heads,rows)=>`| ${heads.join(' | ')} |\n| ${heads.map(()=>'---').join(' | ')} |\n${rows.map(r=>'| '+r.map(v=>String(v??'Not available').replace(/\|/g,'/').replace(/\n/g,' ')).join(' | ')+' |').join('\n')}`;
 const csv=rows=>{if(!rows.length)return '';const keys=Object.keys(rows[0]);const cell=v=>'"'+String(typeof v==='object'?JSON.stringify(v):v??'').replaceAll('"','""')+'"';return '\uFEFF'+[keys.map(cell).join(','),...rows.map(r=>keys.map(k=>cell(r[k])).join(','))].join('\n');};
 export function labReadiness(campaign,snapshot,documents,sources,journals,taskReviews=[],replication=null){
- const config=safeJson(campaign.config_json),docs=new Map(documents.map(d=>[d.section,d]));
- const blockers=[...(snapshot.diagnostics?.blockers||[])];
- const journal=journalAssessment(journals,config.metric_years,config.target_journal);
- if(!journal.eligible)blockers.push('Official three-year journal eligibility evidence missing or below threshold');
- if(!config.target_journal)blockers.push('Target journal not selected');
- if(!config.authors?.length||config.authors.some(a=>!a.name||!a.affiliation)||!config.authors.some(a=>a.corresponding&&a.email))blockers.push('Real authors, affiliations and corresponding author incomplete');
- if(!config.ethics_statement)blockers.push('Human-research ethics/consent statement not supplied');
- if(!config.funding||!config.conflicts)blockers.push('Author-confirmed funding and conflict declarations incomplete');
- if(sources.length<15)blockers.push('Fewer than 15 DOI-verified references');
- if(new Set((config.full_text_verified_dois||[]).map(d=>d.toLowerCase()).filter(d=>sources.some(s=>s.doi.toLowerCase()===d))).size<10)blockers.push('Full-text support verification missing for key literature');
- for(const section of MANUSCRIPT_SECTIONS){const d=docs.get(section);if(!d?.markdown?.trim())blockers.push('Manuscript section missing: '+section);else if(d.evidence_signature!==snapshot.data_digest)blockers.push('Manuscript section uses superseded evidence: '+section);}
- for(const section of ['cover_letter','title_page','highlights','appendices'])if(!docs.get(section)?.markdown?.trim())blockers.push('Submission document missing: '+section);
- const words=MANUSCRIPT_SECTIONS.map(k=>docs.get(k)?.markdown||'').join(' ').split(/\s+/).filter(Boolean).length;
- if(words<3500)blockers.push('Main manuscript below 3500-word internal review floor');
- const replayChecks=safeJson(replication?.checks_json),replayVerified=replication?.data_digest===snapshot.data_digest&&replayChecks.full_seed_replay===true;
- if(!replayVerified)blockers.push('Complete simulation seed replay has not been independently verified');
- for(const review of taskReviews){const output=safeJson(review.output_json);if(output.blockers?.length)blockers.push(...output.blockers.map(b=>`${review.role_id}: ${b}`));}
- if(Number(campaign.failed_tasks||0)>0)blockers.push('Campaign contains exhausted task failures');
- return {status:blockers.length?'DRAFT_REQUIRES_REVIEW':'INTERNAL_REVIEW_COMPLETE',blockers:[...new Set(blockers)],word_count:words,journal,replication:replayVerified?replication:null,
+ const config={...safeJson(campaign.config_json),target_journal:safeJson(campaign.config_json)?.target_journal||DEFAULT_TARGET_JOURNAL};
+ const gate=labGateState(snapshot,{documents,sources,journals,replication},config);
+ const blockers=[...gate.foundation];
+ if(gate.research_ready)blockers.push(...gate.evidence);
+ if(gate.evidence_ready)blockers.push(...gate.manuscript);
+ if(gate.manuscript_ready)blockers.push(...gate.submission);
+ if(gate.submission_ready){
+  if(!config.authors?.length||config.authors.some(a=>!a.name||!a.affiliation)||!config.authors.some(a=>a.corresponding&&a.email))blockers.push('Real authors, affiliations and corresponding author incomplete');
+  if(!config.ethics_statement)blockers.push('Human-research ethics/consent statement not supplied');
+  if(!config.funding||!config.conflicts)blockers.push('Author-confirmed funding and conflict declarations incomplete');
+ }
+ // Historical role reviews often repeat the same project-level blocker. Keep only genuinely new review findings.
+ const canonical=new Set(blockers);
+ for(const review of taskReviews){const output=safeJson(review.output_json);for(const raw of output.blockers||[]){const b=String(raw);if(!canonical.has(b)){canonical.add(b);blockers.push(`${review.role_id}: ${b}`);}}}
+ const unique=[...new Set(blockers)];
+ const stage=!gate.research_ready?'research_foundation':!gate.evidence_ready?'evidence_verification':!gate.manuscript_ready?'manuscript':!gate.submission_ready?'submission_documents':unique.length?'human_declarations':'complete';
+ return {status:unique.length?'DRAFT_REQUIRES_REVIEW':'INTERNAL_REVIEW_COMPLETE',stage,blockers:unique,word_count:gate.word_count,journal:gate.journal,target_journal:gate.target_journal,
+  replication:gate.replay_verified?replication:null,exhausted_task_failures:Number(campaign.failed_tasks||0),
+  warnings:Number(campaign.failed_tasks||0)>0?['Historical exhausted task failures are retained for audit but are not a standalone readiness blocker; unresolved outputs are caught by the active stage gates.']:[],
   acceptance:'Not submitted; journal acceptance is an external editorial decision',human_signoff_required:true};
 }
+
 const REPRO_SCRIPT=`import fs from 'node:fs';
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';

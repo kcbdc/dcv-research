@@ -1,13 +1,13 @@
 import {one,all,run} from './db.js';
 import {uid,nowIso,safeJson,json} from './util.js';
 import {cached,bust} from './memo.js';
-import {extractJson} from './ai.js';
-import {LAB_ROLES,MANUSCRIPT_SECTIONS,DEFAULT_DEADLINE,makeLabPlan,normalizeConfig,writingSection,validateJournalRow,validateLabOutput} from './lab_policy.js';
+import {aiJson} from './ai.js';
+import {LAB_ROLES,MANUSCRIPT_SECTIONS,DEFAULT_DEADLINE,DEFAULT_TARGET_JOURNAL,makeLabPlan,normalizeConfig,writingSection,validateJournalRow,validateLabOutput,labGateState,taskGate} from './lab_policy.js';
 import {readLabSnapshot,promptEvidence,collectLabLiterature} from './lab_evidence.js';
 import {buildLabPackage,labReadiness} from './lab_package.js';
 
 const MAX_ATTEMPTS=3,LEASE_MS=180000;
-const safeConfig=campaign=>safeJson(campaign.config_json);
+const safeConfig=campaign=>normalizeConfig({...safeJson(campaign.config_json),target_journal:safeJson(campaign.config_json)?.target_journal||DEFAULT_TARGET_JOURNAL});
 const nextTime=(c,cursor)=>new Date(Date.parse(c.starts_at)+(Date.parse(c.deadline_at)-900000-Date.parse(c.starts_at))*cursor/c.total_tasks).toISOString();
 async function writeBatches(db,statements){for(let i=0;i<statements.length;i+=40)await db.batch(statements.slice(i,i+40));}
 export async function createLabCampaign(env,projectId,input={}){
@@ -52,14 +52,12 @@ async function inferLabTask(env,c,t,snapshot,inputs){
   manuscript_for_review:role.id==='writer'?undefined:inputs.documents.filter(d=>MANUSCRIPT_SECTIONS.includes(d.section)).map(d=>({section:d.section,markdown:d.markdown.slice(0,1800),signature:d.evidence_signature})),
   instructions:role.id==='writer'?`Write a complete 550–900 word ${section} section (abstract 180–250 words). Revise rather than append. Use explicit limitations. Subsequent passes must address prior reviews. Do not duplicate the section heading.`:
    role.id==='leader'?'Issue an internal editorial decision and actionable blockers. From day 20 onward also draft the four submission documents, with 3–5 highlights of at most 85 characters each. Never invent ethics approval, funding or exclusive-submission declarations.':'Return an evidence-specific critique and concrete improvements.'};
- const model=env.LAB_AI_MODEL||'@cf/meta/llama-3.3-70b-instruct-fp8-fast';
  inputsCompact.references=inputsCompact.references.slice(0,60).map(r=>({...r,abstract:r.abstract?.slice(0,400)}));
- const request=env.AI.run(model,{messages:[{role:'system',content:system},{role:'user',content:JSON.stringify(inputsCompact)}],max_tokens:role.id==='writer'||role.id==='leader'?4500:1800,temperature:.1});
- let timer;const timeout=new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('lab_ai_timeout')),45000);});
- let response;try{response=await Promise.race([request,timeout]);}finally{clearTimeout(timer);}
- const text=typeof response==='string'?response:response?.response||response?.result?.response;
- const output=validateLabOutput(extractJson(text),role,inputs.sources);
- return {...output,_ai:{model,ok:true},section:role.id==='writer'?section:null};
+ const fallback={summary:'AI generation unavailable; no research claims were generated.',findings:[],blockers:['AI generation unavailable'],recommendations:[],markdown:'',documents:{}};
+ const response=await aiJson({...env,AI_MODEL:env.LAB_AI_MODEL||env.AI_MODEL},system,JSON.stringify(inputsCompact),fallback,{maxTokens:role.id==='writer'||role.id==='leader'?4500:1800,required:['summary']});
+ if(!response?._ai?.ok){const e=new Error(response?._ai?.error||'lab_ai_unavailable');if(/429/.test(e.message))e.code='AI_RATE_LIMITED';throw e;}
+ const output=validateLabOutput(response,role,inputs.sources);
+ return {...output,_ai:response._ai,section:role.id==='writer'?section:null};
 }
 
 export async function persistLabPackage(env,c,snapshot,inputs,leaseToken){
@@ -86,6 +84,13 @@ export async function processLabTick(env){
   if(c.cursor>=c.total_tasks||Date.now()+900000>=Date.parse(c.deadline_at))return persistLabPackage(env,c,snapshot,await taskInputs(env,c),token);
   const planned=makeLabPlan()[c.cursor];
   await run(env.DB,'INSERT OR IGNORE INTO lab_tasks(campaign_id,seq,day,role_id,phase) VALUES(?,?,?,?,?)',[c.id,planned.seq,planned.day,planned.role_id,planned.phase]);
+  const inputs=await taskInputs(env,c),gate=labGateState(snapshot,inputs,safeConfig(c)),blocked=taskGate(planned.role_id,gate);
+  const enforceStageGates=env.LAB_ENFORCE_STAGE_GATES==='true'||env.EXTERNAL_RUNTIME==='github-actions';
+  if(enforceStageGates&&blocked.blocked){
+   const message=`Blocked at ${blocked.stage}: ${blocked.blockers.join(' | ')}`.slice(0,1200),wake=new Date(Date.now()+3600000).toISOString();
+   await run(env.DB,`UPDATE lab_campaigns SET next_run_at=?,last_error=?,lease_token=NULL,lease_until=NULL,updated_at=? WHERE id=? AND lease_token=?`,[wake,message,nowIso(),c.id,token]);
+   bust(env,c.project_id,'lab:status');return {status:'blocked',stage:blocked.stage,blockers:blocked.blockers,target_journal:gate.target_journal};
+  }
   const task=await one(env.DB,`UPDATE lab_tasks SET status='running',attempts=attempts+1,started_at=?,error=NULL WHERE campaign_id=? AND seq=? AND status IN ('pending','retry','running') RETURNING *`,[now,c.id,c.cursor]);
   if(!task)throw new Error('lab_cursor_task_missing');
   if(task.attempts>MAX_ATTEMPTS){await completeTaskFailure(env,c,task,token,'Lease expired after maximum task attempts');return {status:'task_exhausted'};}
@@ -94,7 +99,6 @@ export async function processLabTick(env){
    await writeBatches(env.DB,rows.map(r=>env.DB.prepare(`INSERT INTO lab_sources(campaign_id,doi,title,authors_json,journal,published_year,url,abstract,retrieved_at)
     VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(campaign_id,doi) DO UPDATE SET title=excluded.title,authors_json=excluded.authors_json,journal=excluded.journal,published_year=excluded.published_year,abstract=excluded.abstract,retrieved_at=excluded.retrieved_at`).bind(c.id,r.doi,r.title,JSON.stringify(r.authors),r.journal,r.published_year,r.url,r.abstract,r.retrieved_at)));
   }
-  const inputs=await taskInputs(env,c);
   const output=await inferLabTask(env,c,task,snapshot,inputs);
   // Pause/configuration changes revoke the lease. Check again before atomic output writes.
   const owned=await one(env.DB,'SELECT id FROM lab_campaigns WHERE id=? AND lease_token=? AND status=\'active\'',[c.id,token]);
@@ -176,7 +180,7 @@ export async function labApi(request,env,projectId,parts){
  }
  if(method==='PUT'&&action==='config'){
   const input=await request.json(),config=normalizeConfig({...safeConfig(c),...input});
-  await run(env.DB,'UPDATE lab_campaigns SET config_json=?,lease_token=NULL,lease_until=NULL,updated_at=? WHERE id=?',[JSON.stringify(config),nowIso(),c.id]);bust(env,projectId,'lab:status');return json({ok:true,config});
+  await run(env.DB,'UPDATE lab_campaigns SET config_json=?,lease_token=NULL,lease_until=NULL,next_run_at=?,updated_at=? WHERE id=?',[JSON.stringify(config),nowIso(),nowIso(),c.id]);bust(env,projectId,'lab:status');return json({ok:true,config});
  }
  if(method==='POST'&&action==='journals'){
   const rows=(await request.json()).rows;if(!Array.isArray(rows)||rows.length>12)throw new Error('Provide at most twelve journal-year evidence rows');
