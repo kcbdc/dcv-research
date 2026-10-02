@@ -314,7 +314,7 @@ async function priorAggregate(env,candidateId,phase){
 }
 function nForPhase(config,phase){ if(phase==='exploration')return config.exploration_n;if(phase==='refinement')return config.refinement_n;if(phase==='confirmation')return config.confirmation_n;return config.robust_n; }
 export async function computeCandidate(env,projectId,candidateId,phase='exploration',cycle=0){
-  if(['github-actions','hybrid'].includes(env.COMPUTE_EXECUTOR)&&env.EXTERNAL_RUNTIME!=='github-actions')throw new Error('compute_requires_github_actions');
+  if(['github-actions','hybrid'].includes(env.COMPUTE_EXECUTOR)&&env.EXTERNAL_RUNTIME!=='github-actions'&&String(env.EMERGENCY_WORKER_COMPUTE||'')!=='1')throw new Error('compute_requires_github_actions');
   const c=await one(env.DB,`SELECT * FROM design_candidates WHERE id=? AND project_id=?`,[candidateId,projectId]);if(!c)throw new Error('candidate_not_found');
   const projectMeta=await cached(env,projectId,'project:compute-meta',()=>one(env.DB,`SELECT research_cycle,evidence_revision FROM projects WHERE id=?`,[projectId]),30_000);const projectCycle=Number(projectMeta?.research_cycle||1),projectRev=Number(projectMeta?.evidence_revision||0);if(Number(c.research_cycle||1)!==projectCycle)throw new Error('candidate_superseded_by_new_cycle');
   await assertProtocolIntegrity(env,projectId,{cycle:projectCycle});

@@ -27,7 +27,14 @@ export function jobExecutionLane(type){
 }
 function runtimeLane(env){
   const mode=String(env.COMPUTE_EXECUTOR||'cloudflare');
-  if(mode==='hybrid') return env.EXTERNAL_RUNTIME==='github-actions'?'github-hybrid':'worker-hybrid';
+  if(mode==='hybrid') {
+    if(env.EXTERNAL_RUNTIME==='github-actions') return 'github-hybrid';
+    // Emergency escape hatch: only enabled by the stall detector. It lets the Worker
+    // execute ONE compute_candidate when the external runner has demonstrably stopped
+    // consuming queued work. Normal hybrid operation still keeps heavy compute on GitHub.
+    if(String(env.EMERGENCY_WORKER_COMPUTE||'')==='1') return 'worker-emergency';
+    return 'worker-hybrid';
+  }
   if(mode==='github-actions') return env.EXTERNAL_RUNTIME==='github-actions'?'all':'none';
   return 'all';
 }
@@ -35,6 +42,7 @@ function laneSqlFor(lane){
   const workerOnly=WORKER_FAST_JOB_TYPES.map(x=>`'${x}'`).join(',');
   const shared=SHARED_FAST_JOB_TYPES.map(x=>`'${x}'`).join(',');
   if(lane==='worker-hybrid') return ` AND type IN (${workerOnly},${shared})`;
+  if(lane==='worker-emergency') return ` AND type IN (${workerOnly},${shared},'compute_candidate')`;
   if(lane==='github-hybrid') return ` AND type NOT IN (${workerOnly})`;
   return '';
 }
@@ -116,9 +124,10 @@ export async function claimJobs(env, limit=4) {
   const laneOrder=lane==='github-hybrid'
     ? `CASE WHEN type='compute_candidate' THEN 0 WHEN type='advance_project' THEN 1 WHEN type IN ('validate_project','fit_reviewer') THEN 2 WHEN type IN (${SHARED_FAST_JOB_TYPES.map(x=>`'${x}'`).join(',')}) THEN 3 ELSE 2 END,`
     : '';
+  const effectiveLimit=lane==='worker-emergency'?Math.min(1,Math.max(1,Number(limit)||1)):limit;
   const jobs = await all(env.DB, `SELECT * FROM jobs WHERE status='queued' AND run_after<=?${laneSql}
     AND CASE type WHEN 'collect_project' THEN 180 WHEN 'generate_report' THEN 100 WHEN 'advance_project' THEN 90 ELSE 60 END<=?
-    ORDER BY ${laneOrder} priority ASC, created_at ASC LIMIT ?`, [nowIso(), remaining, limit]);
+    ORDER BY ${lane==='worker-emergency'?`CASE WHEN type='compute_candidate' THEN 0 ELSE 1 END,`:laneOrder} priority ASC, created_at ASC LIMIT ?`, [nowIso(), remaining, effectiveLimit]);
   if(!jobs.length&&remaining<180){const waiting=await one(env.DB,`SELECT 1 x FROM jobs WHERE status='queued' AND run_after<=? LIMIT 1`,[nowIso()]);if(waiting)env.RUNNER_BUDGET_DEFERRED=true;}
   const claimed=[];
   for (const j of jobs) {
