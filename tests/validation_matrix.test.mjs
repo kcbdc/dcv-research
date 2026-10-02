@@ -57,3 +57,19 @@ test('Figure 7 survival funnel uses strict cumulative PASS and exposes N/A layer
   assert.match(f.svg,/N\/A · gate unavailable/);
   assert.ok(!/undefined|NaN/.test(f.svg));
 });
+
+test('External Validation Matrix preserves last valid snapshot while a new evidence revision is revalidating',async()=>{
+  const DB=makeDb(),pid=await seedProject(DB,{candidates:1,reviewer:0,episodes:0}),cid='cand_0',ts=now();
+  DB.raw.prepare(`DELETE FROM simulation_runs WHERE project_id=? AND candidate_id=?`).run(pid,cid);
+  DB.raw.prepare(`INSERT INTO simulation_runs(id,project_id,candidate_id,phase,seed,n,result_json,created_at,evidence_revision) VALUES('c_stale',?,?,'confirmation',1,100,?,?,0)`).run(pid,cid,ev('FEASIBLE',{Synthetic:{classification:'FEASIBLE'}}),ts);
+  await refreshValidationMatrix({DB},pid);
+  DB.raw.prepare(`UPDATE projects SET evidence_revision=1 WHERE id=?`).run(pid);
+  const vm=await getValidationMatrix({DB},pid);
+  assert.equal(vm.stale,true);
+  assert.equal(vm.basis,'LAST_KNOWN_VALID_SNAPSHOT');
+  assert.equal(vm.revision,0);
+  assert.equal(vm.current_revision,1);
+  assert.equal(vm.rows.length,1);
+  assert.equal(vm.rows[0].synthetic_status,'PASS');
+  assert.equal(vm.stale_reason,'CURRENT_REVISION_REVALIDATION_PENDING');
+});
