@@ -43,8 +43,24 @@ async function main(){
  const env={...cfg.vars,DB,COMPUTE_EXECUTOR:'hybrid',EXTERNAL_RUNTIME:'github-actions',MAX_JOBS_PER_TICK:'1',RUNNER_CODE_REVISION:process.env.GITHUB_SHA||'local',ECOS_API_KEY:process.env.ECOS_API_KEY,OPENFISCAL_API_KEY:process.env.OPENFISCAL_API_KEY,BOJO_API_KEY:process.env.BOJO_API_KEY,FDIC_API_KEY:process.env.FDIC_API_KEY};
  env.RUNNER_JOB_OBSERVER=(type,stage,error)=>console.log(JSON.stringify({stage,job_type:type,d1_api_calls:DB.calls,...(error?{diagnostic:safeDiagnostic(error)}:{})}));
  if(CF_AI_API_TOKEN)env.AI={run:async(model,input)=>{
-  const r=await fetch(`https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/run/${model}`,{method:'POST',headers:{authorization:`Bearer ${CF_AI_API_TOKEN}`,'content-type':'application/json'},body:JSON.stringify(input),signal:AbortSignal.timeout(55000)});
-  const j=await r.json();if(!r.ok||j.success===false)throw new Error(`Workers AI REST failed (${r.status})`);return j.result;
+  const url=`https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/run/${model}`;
+  const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+  let lastError=null;
+  for(let attempt=0;attempt<3;attempt++){
+   const r=await fetch(url,{method:'POST',headers:{authorization:`Bearer ${CF_AI_API_TOKEN}`,'content-type':'application/json'},body:JSON.stringify(input),signal:AbortSignal.timeout(55000)});
+   let j=null;try{j=await r.json();}catch{}
+   if(r.ok&&j?.success!==false)return j?.result;
+   const retryAfterRaw=r.headers.get('retry-after');
+   const retryAfterSeconds=retryAfterRaw&&/^\d+(?:\.\d+)?$/.test(retryAfterRaw)?Number(retryAfterRaw):null;
+   const retryAfterMs=retryAfterSeconds!=null?Math.ceil(retryAfterSeconds*1000):Math.min(1500*(2**attempt),6000);
+   const error=new Error(`Workers AI REST failed (${r.status})`);
+   error.status=r.status;error.code=r.status===429?'AI_RATE_LIMITED':'AI_REST_FAILED';error.retryAfterMs=retryAfterMs;
+   lastError=error;
+   // 429/5xx는 같은 모델에서만 제한적으로 재시도한다. 모델 전환으로 계정 단위 rate limit을 증폭하지 않는다.
+   if(attempt<2&&(r.status===429||r.status>=500)){await sleep(Math.min(retryAfterMs,8000));continue;}
+   throw error;
+  }
+  throw lastError||new Error('Workers AI REST failed');
  }};
  stage='acquire_and_process_jobs';const result=await runActions(env);console.log(JSON.stringify(result));if(result.failures)process.exitCode=1;
  }catch(error){error.stage||=stage;throw error;}
