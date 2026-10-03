@@ -42,7 +42,7 @@ export async function fitReviewerModel(env,projectId){
   const def=await latestDefinition(env,projectId),v=def?.content?.validation||{};
   const lastObserved=rows[0]?.created_at??'';
   const countBy=new Map(),cap=Math.max(1,Math.min(30,Number(v.max_trials_per_participant||30)));
-  rows=rows.reverse().filter(r=>{if(v.human_protocol&&(!r.trial_id||safeJson(r.context_json).protocol!==v.human_protocol))return false;const id=r.participant_hash||'anon',n=countBy.get(id)||0;countBy.set(id,n+1);return id!=='anon'&&n<cap;});
+  rows=rows.reverse().filter(r=>{const rp=safeJson(r.context_json).protocol||null;if(v.human_protocol&&rp&&rp!==v.human_protocol)return false;const id=r.participant_hash||'anon',n=countBy.get(id)||0;countBy.set(id,n+1);return id!=='anon'&&n<cap;});
   const minParticipants=Number(v.min_human_participants||30),minCorrect=Number(v.min_human_correct_trials||60),minWrong=Number(v.min_human_wrong_trials||60),B=Math.max(300,Math.min(1000,Number(v.cluster_bootstrap_n||300)));
   const participantN=new Set(rows.map(r=>String(r.participant_hash||'anon'))).size,correctN=rows.filter(r=>Number(r.ai_correct)===1).length,wrongN=rows.filter(r=>Number(r.ai_correct)===0).length;
   const gate={participants:{observed:participantN,required:minParticipants,pass:participantN>=minParticipants},correct_trials:{observed:correctN,required:minCorrect,pass:correctN>=minCorrect},wrong_trials:{observed:wrongN,required:minWrong,pass:wrongN>=minWrong}};
@@ -53,7 +53,7 @@ export async function fitReviewerModel(env,projectId){
     await audit(env,projectId,'agent','reviewer.fit.hold','project',projectId,{n:rows.length,gate,reason:'human_validation_sample_gate',cluster_bootstrap:diagnosticCluster});
     return {status:'HOLD',n:rows.length,participants:participantN,gate,cluster_bootstrap:diagnosticCluster};
   }
-  const point=metrics(rows),cluster=clusterBootstrap(rows,B,20260930),model={...point,participants:participantN,cluster_bootstrap:cluster,sample_gate:gate,unit_of_inference:'participant-cluster bootstrap; repeated trials are not treated as independent participants'};
+  const point=metrics(rows),cluster=clusterBootstrap(rows,B,20260930),legacyUntagged=rows.filter(r=>!safeJson(r.context_json).protocol).length,model={...point,participants:participantN,human_protocol:v.human_protocol||null,legacy_untagged_trials:legacyUntagged,last_observed_at:lastObserved,cluster_bootstrap:cluster,sample_gate:gate,unit_of_inference:'participant-cluster bootstrap; repeated trials are not treated as independent participants'};
   const ver=await one(env.DB,`SELECT COALESCE(MAX(version),0) v FROM reviewer_models WHERE project_id=?`,[projectId]);
   const id=uid('reviewermodel'); await run(env.DB,`INSERT INTO reviewer_models(id,project_id,version,model_json,created_at,research_cycle,evidence_revision) VALUES(?,?,?,?,?,?,?)`,[id,projectId,(ver?.v||0)+1,JSON.stringify(model),nowIso(),Number(p?.research_cycle||1),Number(p?.evidence_revision||0)]);
   bust(env,projectId,'reviewer:latest');

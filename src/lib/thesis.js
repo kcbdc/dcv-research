@@ -87,14 +87,14 @@ export async function buildThesisData(env, projectId) {
   const content = safeJson(def?.content_json, {}), constraints = safeJson(cfg.constraints_json, {}), design = safeJson(cfg.design_json, {});
   const cycle=Number(project.research_cycle||1),rev=Number(project.evidence_revision||0);
   const appr = await one(env.DB, `SELECT * FROM approvals WHERE project_id=? AND research_cycle=? AND evidence_revision=? AND stale_at IS NULL ORDER BY created_at DESC LIMIT 1`, [projectId,cycle,rev]);
-  const rmodel = await one(env.DB, `SELECT model_json,version,created_at FROM reviewer_models WHERE project_id=? AND research_cycle=? AND evidence_revision=? ORDER BY version DESC LIMIT 1`, [projectId,cycle,rev]);
+  const rmodel = await one(env.DB, `SELECT model_json,version,created_at,research_cycle,evidence_revision FROM reviewer_models WHERE project_id=? ORDER BY CASE WHEN research_cycle=? AND evidence_revision=? THEN 0 ELSE 1 END, version DESC LIMIT 1`, [projectId,cycle,rev]);
   const protocol = await latestProtocol(env, projectId);
 
   const candRows = await all(env.DB, `SELECT c.*, ${CLASS_SQL} AS klass FROM design_candidates c WHERE c.project_id=? AND c.research_cycle=?`, [projectId,cycle]);
   const cands = candRows.map(c => ({ id: c.id, sigma: r4(c.sigma), tau: c.tau, alpha: r4(c.alpha), base_id:c.base_id,role:c.candidate_role||'exploratory',K: c.authority_k, d: c.delay_d, W: r4(c.recovery_w), m: r4(c.adjust_m), estimator: c.estimator || 'ema', status: c.status, evidence_status: c.evidence_status, klass: c.klass, boundary_score: r4(c.boundary_score), max_regret: r4(c.max_regret), objective_score: r4(c.objective_score) }));
 
   // simulation_runs 는 한 번만 읽는다(이전: 이 조회 + 단계별 집계 조회로 2회 스캔). decisions 는 단계별 집계용으로 함께 꺼낸다.
-  const runRows = await all(env.DB, `SELECT r.candidate_id,r.phase,r.n,r.loss_mean,r.loss_exceed_rate,r.fp_rate,r.fn_rate,r.review_burden,r.recovery_time,r.regret,r.result_json,r.created_at,COALESCE(json_extract(r.result_json,'$.decisions'),0) AS decisions FROM simulation_runs r WHERE r.project_id=? AND r.research_cycle=? ORDER BY r.created_at`, [projectId,cycle]);
+  const runRows = await all(env.DB, `SELECT r.candidate_id,r.phase,r.n,r.loss_mean,r.loss_exceed_rate,r.fp_rate,r.fn_rate,r.review_burden,r.recovery_time,r.regret,r.result_json,r.created_at,COALESCE(json_extract(r.result_json,'$.decisions'),0) AS decisions FROM simulation_runs r JOIN design_candidates dc ON dc.id=r.candidate_id WHERE r.project_id=? AND dc.research_cycle=? ORDER BY r.created_at`, [projectId,cycle]);
   const best = new Map(), byCandPhase = new Map();
   for (const r of runRows) {
     byCandPhase.set(`${r.candidate_id}|${r.phase}`, r);
@@ -251,15 +251,15 @@ export async function buildThesisData(env, projectId) {
   // 인간 검토자: reviewer_observations 를 한 번만 스캔한다(이전: 전체 집계 + 신뢰도별 집계로 2회 스캔).
   // (신뢰도 구간 × 참가자)로 묶어 가져오면 행 수는 구간수×참가자수로 줄고, 합계·참가자 수·구간별 값을 모두 여기서 만든다.
   const humanProtocol=content.validation?.human_protocol||null;
-  const humanGroups = await all(env.DB, `SELECT CASE WHEN ? IS NULL OR (trial_id IS NOT NULL AND json_extract(context_json,'$.protocol')=?) THEN 1 ELSE 0 END eligible, ROUND(ai_confidence,2) confidence, participant_hash ph, COUNT(*) n, SUM(response_ms) rt,
+  const humanGroups = await all(env.DB, `SELECT CASE WHEN ? IS NULL OR json_extract(context_json,'$.protocol')=? OR json_extract(context_json,'$.protocol') IS NULL THEN 1 ELSE 0 END eligible, ROUND(ai_confidence,2) confidence, participant_hash ph, CASE WHEN json_extract(context_json,'$.protocol') IS NULL THEN 1 ELSE 0 END legacy_untagged, COUNT(*) n, SUM(response_ms) rt,
     SUM(CASE WHEN ai_correct=1 THEN 1 ELSE 0 END) correct_n, SUM(CASE WHEN ai_correct=1 AND human_accept=1 THEN 1 ELSE 0 END) acc_c,
     SUM(CASE WHEN ai_correct=0 THEN 1 ELSE 0 END) wrong_n, SUM(CASE WHEN ai_correct=0 AND human_accept=1 THEN 1 ELSE 0 END) acc_w,
     SUM(CASE WHEN ai_correct=1 AND human_accept=0 THEN 1 ELSE 0 END) right_override,
     SUM(CASE WHEN (ai_correct=1 AND human_accept=1) OR (ai_correct=0 AND human_accept=0) THEN 1 ELSE 0 END) appropriate
-    FROM reviewer_observations WHERE project_id=? GROUP BY eligible, ROUND(ai_confidence,2), participant_hash`, [humanProtocol,humanProtocol,projectId]);
+    FROM reviewer_observations WHERE project_id=? GROUP BY eligible, ROUND(ai_confidence,2), participant_hash, legacy_untagged`, [humanProtocol,humanProtocol,projectId]);
   const rvRows=humanGroups.filter(r=>Number(r.eligible)===1);
   const cumulativeParticipants=new Set(humanGroups.map(r=>r.ph).filter(p=>p && p!=='anonymous'));
-  const cumulativeTrials=humanGroups.reduce((n,r)=>n+Number(r.n||0),0);
+  const cumulativeTrials=humanGroups.reduce((n,r)=>n+Number(r.n||0),0),legacyUntaggedTrials=humanGroups.filter(r=>Number(r.eligible)===1&&Number(r.legacy_untagged)===1).reduce((n,r)=>n+Number(r.n||0),0);
   const rvT = { n: 0, rt: 0, appropriate: 0, wrong_n: 0, wrong_accept: 0, right_n: 0, right_override: 0 }, rvParticipants = new Set(), confMap = new Map();
   for (const g of rvRows) {
     const n = Number(g.n) || 0; rvT.n += n; rvT.rt += Number(g.rt) || 0; rvT.appropriate += Number(g.appropriate) || 0;
@@ -273,9 +273,9 @@ export async function buildThesisData(env, projectId) {
   const N = k => Number(rvTot?.[k] || 0);
   const byConfidence = confRows.map(e => ({ confidence: Number(e.confidence), n: e.n, correct_n: Number(e.correct_n), wrong_n: Number(e.wrong_n), accept_when_correct: ci(Number(e.acc_c), Number(e.correct_n)), accept_when_wrong: ci(Number(e.acc_w), Number(e.wrong_n)), mean_rt_ms: r4(e.mean_rt) }));
   const reviewer = {
-    n: N('n'), participants: N('participants'), cumulative_participants:cumulativeParticipants.size, cumulative_trials:cumulativeTrials, excluded_trials:cumulativeTrials-N('n'), exclusion_note:'현재 인간실험 규약에 부합하지 않는 과거 기록은 보존하되 현재 분석에서 제외합니다.',
+    n: N('n'), participants: N('participants'), cumulative_participants:cumulativeParticipants.size, cumulative_trials:cumulativeTrials, excluded_trials:cumulativeTrials-N('n'), legacy_untagged_trials:legacyUntaggedTrials, exclusion_note:'명시적으로 다른 인간실험 규약의 기록만 현재 분석에서 제외하며, 규약 태그 도입 전 legacy 무태그 기록은 현재 규약으로 이월합니다.',
     arr: ci(N('appropriate'), N('n')), false_accept: ci(N('wrong_accept'), N('wrong_n')), correct_override: ci(N('wrong_n') - N('wrong_accept'), N('wrong_n')), unnecessary_override: ci(N('right_override'), N('right_n')),
-    mean_rt_ms: r4(rvTot?.mean_rt), by_confidence: byConfidence, model: safeJson(rmodel?.model_json, null), model_version: rmodel?.version ?? null, cluster_bootstrap: safeJson(rmodel?.model_json, null)?.cluster_bootstrap || clusterBootstrapGrouped(rvRows),protocol:humanProtocol||'legacy',participant_distribution:[...rvRows.reduce((m,r)=>m.set(r.ph,(m.get(r.ph)||0)+Number(r.n)),new Map()).values()]
+    mean_rt_ms: r4(rvTot?.mean_rt), by_confidence: byConfidence, model: safeJson(rmodel?.model_json, null), model_version: rmodel?.version ?? null, model_current:!!rmodel&&Number(rmodel.research_cycle||0)===cycle&&Number(rmodel.evidence_revision||-1)===rev, model_evidence_revision:rmodel?.evidence_revision??null, cluster_bootstrap: safeJson(rmodel?.model_json, null)?.cluster_bootstrap || clusterBootstrapGrouped(rvRows),protocol:humanProtocol||'legacy',participant_distribution:[...rvRows.reduce((m,r)=>m.set(r.ph,(m.get(r.ph)||0)+Number(r.n)),new Map()).values()]
   };
 
   // 실증 패널
