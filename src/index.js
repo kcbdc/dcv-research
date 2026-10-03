@@ -64,18 +64,15 @@ async function cycleStats(env,projectId,cycle){
   }catch{}
   const fallback=await env.DB.batch([
     env.DB.prepare(`SELECT COUNT(*) total,SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) unevaluated,SUM(CASE WHEN status='confirmed_feasible' THEN 1 ELSE 0 END) feasible,SUM(CASE WHEN status IN ('infeasible','confirmation_failed') THEN 1 ELSE 0 END) infeasible,SUM(CASE WHEN evidence_status='UNRESOLVED' THEN 1 ELSE 0 END) unresolved,AVG(boundary_score) avg_boundary,MIN(max_regret) min_regret,MAX(CASE WHEN max_regret IS NOT NULL THEN updated_at END) regret_updated_at FROM design_candidates WHERE project_id=? AND research_cycle=?`).bind(projectId,cycle),
-    env.DB.prepare(`SELECT COUNT(*) simulation_total,SUM(CASE WHEN phase='exploration' THEN 1 ELSE 0 END) simulation_exploration,SUM(CASE WHEN phase='refinement' THEN 1 ELSE 0 END) simulation_refinement,SUM(CASE WHEN phase='confirmation' THEN 1 ELSE 0 END) simulation_confirmation,SUM(CASE WHEN phase IN ('historical','stress') THEN 1 ELSE 0 END) simulation_robust,MAX(created_at) latest_simulation_at FROM simulation_runs WHERE project_id=? AND research_cycle=?`).bind(projectId,cycle)
+    env.DB.prepare(`SELECT COUNT(*) simulation_total,SUM(CASE WHEN r.phase='exploration' THEN 1 ELSE 0 END) simulation_exploration,SUM(CASE WHEN r.phase='refinement' THEN 1 ELSE 0 END) simulation_refinement,SUM(CASE WHEN r.phase='confirmation' THEN 1 ELSE 0 END) simulation_confirmation,SUM(CASE WHEN r.phase IN ('historical','stress') THEN 1 ELSE 0 END) simulation_robust,MAX(r.created_at) latest_simulation_at FROM simulation_runs r JOIN design_candidates c ON c.id=r.candidate_id WHERE r.project_id=? AND c.research_cycle=?`).bind(projectId,cycle)
   ]);
   return {...(fallback[0]?.results?.[0]||{}),...(fallback[1]?.results?.[0]||{})};
 }
 async function humanStats(env,projectId,cycle,humanProtocol=null){
-  try{return await one(env.DB,`SELECT
-    COALESCE((SELECT reviewer_obs_count FROM projects WHERE id=?),0) observations,
-    (SELECT COUNT(*) FROM reviewer_participants_total WHERE project_id=?) participants,
-    (SELECT COUNT(DISTINCT participant_hash) FROM reviewer_participants_cycle WHERE project_id=? AND (? IS NULL OR protocol=?)) eligible_participants`,[projectId,projectId,projectId,humanProtocol,humanProtocol]);}
-  catch{return one(env.DB,`SELECT COUNT(*) observations, COUNT(DISTINCT NULLIF(participant_hash,'anonymous')) participants,
-    COUNT(DISTINCT CASE WHEN (? IS NULL OR (trial_id IS NOT NULL AND json_extract(context_json,'$.protocol')=?)) THEN NULLIF(participant_hash,'anonymous') END) eligible_participants
-    FROM reviewer_observations WHERE project_id=?`,[humanProtocol,humanProtocol,projectId]);}
+  return one(env.DB,`SELECT COALESCE(p.reviewer_obs_count,0) observations,
+    (SELECT COUNT(DISTINCT NULLIF(participant_hash,'anonymous')) FROM reviewer_observations WHERE project_id=p.id) participants,
+    (SELECT COUNT(DISTINCT CASE WHEN (? IS NULL OR json_extract(context_json,'$.protocol')=? OR json_extract(context_json,'$.protocol') IS NULL) THEN NULLIF(participant_hash,'anonymous') END) FROM reviewer_observations WHERE project_id=p.id) eligible_participants
+    FROM projects p WHERE p.id=?`,[humanProtocol,humanProtocol,projectId]);
 }
 
 async function storageIntegrity(env,pcols=null,knownProjectCount=null){
@@ -205,7 +202,8 @@ async function api(request,env,ctx=null){
     if(parts[3]==='reviewer-observations' && method==='POST'){
       const b=await bodyJson(request);if(b.trial_id){try{const saved=await recordHumanTrial(env,projectId,b);const ev=await registerEvidence(env,projectId,{kind:'HUMAN_TRIAL',source:'calibrated_task_v2',detail:{observation_id:saved.id}});return json({...saved,revalidation:ev},201);}catch(e){return json({error:e.message},400);}} const id=uid('review');
       await env.DB.batch([   // 관측 INSERT + 프로젝트 카운터 증가를 한 batch(원자적)로
-        env.DB.prepare(`INSERT INTO reviewer_observations(id,project_id,participant_hash,ai_confidence,ai_correct,human_accept,response_ms,recovered,recovery_ms,context_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`).bind(id,projectId,String(b.participant_hash||'anon'),Number(b.ai_confidence),b.ai_correct?1:0,b.human_accept?1:0,Number(b.response_ms||0),b.recovered?1:0,b.recovery_ms==null?null:Number(b.recovery_ms),JSON.stringify(b.context||{}),nowIso())
+        env.DB.prepare(`INSERT INTO reviewer_observations(id,project_id,participant_hash,ai_confidence,ai_correct,human_accept,response_ms,recovered,recovery_ms,context_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`).bind(id,projectId,String(b.participant_hash||'anon'),Number(b.ai_confidence),b.ai_correct?1:0,b.human_accept?1:0,Number(b.response_ms||0),b.recovered?1:0,b.recovery_ms==null?null:Number(b.recovery_ms),JSON.stringify(b.context||{}),nowIso()),
+        env.DB.prepare(`UPDATE projects SET reviewer_obs_count=reviewer_obs_count+1,updated_at=? WHERE id=? AND EXISTS(SELECT 1 FROM reviewer_observations WHERE id=?)`).bind(nowIso(),projectId,id)
       ]);
       const ev=await registerEvidence(env,projectId,{kind:'HUMAN_TRIAL',source:'reviewer_ui',detail:{observation_id:id}}); return json({id,revalidation:ev},201);
     }
