@@ -6,6 +6,7 @@ const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': 
 const EST = { ema: 'EMA', kalman: 'Kalman', changepoint: 'Change-point', adaptive: 'Adaptive' };
 const estName = e => EST[e] || e;
 const fx = (v, d = 2) => Number(v).toFixed(d).replace(/\.?0+$/, '') || '0';
+const regretFx = v => { const n=Number(v); if(!Number.isFinite(n)) return '대기'; if(n===0) return '0'; const a=Math.abs(n); if(a<1e-4) return n.toExponential(2); if(a<1e-2) return n.toFixed(6).replace(/0+$/,'').replace(/\.$/,''); return n.toFixed(4).replace(/0+$/,'').replace(/\.$/,''); }; 
 const pct = v => `${Math.round(v * 100)}%`;
 
 export function figureCatalog(t) {
@@ -72,17 +73,19 @@ export function figEstimators(t) {
 }
 
 export function figRegret(t) {
-  const fs = t.candidates.finalists, sel = t.selected?.id, rowH = 34, W = 860, m = { l: 300, r: 70, t: 24, b: 84 }, H = m.t + m.b + fs.length * rowH;
-  const max = Math.max(...fs.map(f => f.max_regret ?? 0), 1e-6) * 1.15, ticks = niceTicks(0, max, 5), X = v => m.l + (W - m.l - m.r) * v / max;
-  let body = ticks.map(v => `<line x1="${X(v)}" x2="${X(v)}" y1="${m.t}" y2="${H - m.b}" stroke="${C.grid}"/>${text(X(v), H - m.b + 18, fx(v, 3), { anchor: 'middle', size: 11 })}`).join('');
+  const all = t.candidates.finalists || [], fs = all.filter(f => f.max_regret!=null && f.max_regret!=='' && Number.isFinite(Number(f.max_regret))), sel = t.selected?.id;
+  if(!fs.length) return wrap(860,240,text(430,96,'Minimax Regret 계산 대기',{anchor:'middle',size:18,weight:700})+text(430,128,'Historical + Stress 시나리오가 2개 이상 비교 가능한 후보에 대해 완료되면 순위를 표시합니다.',{anchor:'middle',size:12,fill:C.mute}),'강건 후보의 Minimax Regret 순위');
+  const rowH = 34, W = 860, m = { l: 300, r: 92, t: 24, b: 84 }, H = m.t + m.b + fs.length * rowH;
+  const maxValue=Math.max(...fs.map(f=>Math.max(0,Number(f.max_regret))),0), scaleMax=Math.max(maxValue,1e-9)*1.15, ticks = niceTicks(0, scaleMax, 5), X = v => m.l + (W - m.l - m.r) * Number(v) / scaleMax;
+  let body = ticks.map(v => `<line x1="${X(v)}" x2="${X(v)}" y1="${m.t}" y2="${H - m.b}" stroke="${C.grid}"/>${text(X(v), H - m.b + 18, regretFx(v), { anchor: 'middle', size: 10.5 })}`).join('');
   fs.forEach((f, i) => {
-    const y = m.t + i * rowH, isSel = f.id === sel, w = X(f.max_regret ?? 0) - m.l;
-    body += text(m.l - 10, y + rowH / 2 + 4, `#${i + 1} ${estName(f.estimator)} σ=${fx(f.sigma)} α=${fx(f.alpha)} K=${f.K} d=${f.d}`, { anchor: 'end', size: 12, weight: isSel ? 700 : 400 }) + `<rect x="${m.l}" y="${y + 6}" width="${Math.max(1, w)}" height="${rowH - 12}" fill="${isSel ? C.ok : C.sky}"/>` + text(m.l + w + 6, y + rowH / 2 + 4, fx(f.max_regret ?? 0, 4), { size: 11 });
+    const y = m.t + i * rowH, isSel = f.id === sel, val=Math.max(0,Number(f.max_regret)), w = X(val) - m.l;
+    body += text(m.l - 10, y + rowH / 2 + 4, `#${i + 1} ${estName(f.estimator)} σ=${fx(f.sigma)} α=${fx(f.alpha)} K=${f.K} d=${f.d}`, { anchor: 'end', size: 12, weight: isSel ? 700 : 400 }) + `<rect x="${m.l}" y="${y + 6}" width="${Math.max(val===0?2:1, w)}" height="${rowH - 12}" fill="${isSel ? C.ok : C.sky}"/>` + text(m.l + Math.max(w,2) + 6, y + rowH / 2 + 4, regretFx(val), { size: 11 });
   });
+  if(maxValue===0) body+=text(m.l,H-48,'모든 비교 가능 후보의 regret이 0으로 동률입니다.',{size:11,fill:C.mute});
   body += `<line x1="${m.l}" x2="${m.l}" y1="${m.t}" y2="${H - m.b}" stroke="${C.ink}"/>` + text(m.l + (W - m.l - m.r) / 2, H - 14, 'Maximum regret', { anchor: 'middle', size: 13, weight: 700 }) + (sel ? legendRow(m.l, H - 34, [{ mark: `<rect width="12" height="12" y="-6" fill="${C.ok}"/>`, label: '최종 선택 후보', w: 140 }]) : '');
   return wrap(W, H, body, '강건 후보의 Minimax Regret 순위');
 }
-
 
 export function figExternalValidationMatrix(t) {
   const vm=t.validation_matrix||t.simulation?.validation_matrix||{rows:[],stages:[],summary:[]};
