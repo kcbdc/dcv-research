@@ -27,8 +27,7 @@ export async function recordHumanTrial(env,projectId,b){
  const rs=await env.DB.batch([
   env.DB.prepare(`INSERT INTO reviewer_observations(id,project_id,participant_hash,ai_confidence,ai_correct,human_accept,response_ms,recovered,recovery_ms,context_json,created_at,trial_id)
   SELECT ?,?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM reviewer_trials WHERE id=? AND status='pending')`).bind(id,projectId,b.participant_hash,t.confidence,t.ai_correct,b.human_accept?1:0,b.response_ms,recovered?1:0,recovered?b.response_ms:null,JSON.stringify({protocol:HUMAN_PROTOCOL,task:safeJson(t.task_json),cycle:t.research_cycle}),nowIso(),t.id,t.id),
-  env.DB.prepare("UPDATE reviewer_trials SET status='done' WHERE id=? AND EXISTS(SELECT 1 FROM reviewer_observations WHERE id=?)").bind(t.id,id),
-  env.DB.prepare('UPDATE projects SET reviewer_obs_count=reviewer_obs_count+1 WHERE id=? AND EXISTS(SELECT 1 FROM reviewer_observations WHERE id=?)').bind(projectId,id)
+  env.DB.prepare("UPDATE reviewer_trials SET status='done' WHERE id=? AND EXISTS(SELECT 1 FROM reviewer_observations WHERE id=?)").bind(t.id,id)
  ]);
  if(!rs[0].meta?.changes)throw new Error('Trial already consumed');
  return {id,correct,recovered,protocol:HUMAN_PROTOCOL};

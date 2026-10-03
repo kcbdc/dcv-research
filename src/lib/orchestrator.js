@@ -298,12 +298,24 @@ export async function scheduleAll(env,{process=true}={}){
     if(p.due&&!p.collecting&&!p.pending_compute)await enqueueOnce(env,p.id,'collect_project',{refresh:true},25);
   }
   // Progress reports are available before human/sign-off gates pass; coalesce pending work.
-  const missingReports=await all(env.DB,`SELECT p.id FROM projects p WHERE p.auto_run=1
+  let missingReports;
+  try{missingReports=await all(env.DB,`SELECT p.id FROM projects p
+    LEFT JOIN project_cycle_stats pcs ON pcs.project_id=p.id AND pcs.research_cycle=p.research_cycle
+    WHERE p.auto_run=1
     AND EXISTS(SELECT 1 FROM definitions d WHERE d.project_id=p.id)
     AND NOT EXISTS(SELECT 1 FROM reports r WHERE r.project_id=p.id AND r.research_cycle=p.research_cycle AND r.evidence_revision=p.evidence_revision AND r.stale_at IS NULL
-      AND r.created_at>=COALESCE((SELECT MAX(sr.created_at) FROM simulation_runs sr JOIN design_candidates dc ON dc.id=sr.candidate_id WHERE sr.project_id=p.id AND dc.research_cycle=p.research_cycle),r.created_at))
+      AND r.created_at>=COALESCE(pcs.latest_simulation_at,r.created_at))
     AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.project_id=p.id AND j.type='generate_report' AND j.status IN ('queued','running'))
-    ORDER BY p.updated_at,p.id LIMIT 4`);
+    ORDER BY p.updated_at,p.id LIMIT 4`);}catch(_){
+    // Compatibility only until migration 0022 is applied. This old path is intentionally
+    // isolated so production switches to the O(1) cycle summary immediately after migration.
+    missingReports=await all(env.DB,`SELECT p.id FROM projects p WHERE p.auto_run=1
+      AND EXISTS(SELECT 1 FROM definitions d WHERE d.project_id=p.id)
+      AND NOT EXISTS(SELECT 1 FROM reports r WHERE r.project_id=p.id AND r.research_cycle=p.research_cycle AND r.evidence_revision=p.evidence_revision AND r.stale_at IS NULL
+        AND r.created_at>=COALESCE((SELECT MAX(sr.created_at) FROM simulation_runs sr JOIN design_candidates dc ON dc.id=sr.candidate_id WHERE sr.project_id=p.id AND dc.research_cycle=p.research_cycle),r.created_at))
+      AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.project_id=p.id AND j.type='generate_report' AND j.status IN ('queued','running'))
+      ORDER BY p.updated_at,p.id LIMIT 4`);
+  }
   for(const p of missingReports)await enqueueOnce(env,p.id,'generate_report',{},105);
   // 끝난 job 정리는 하루 4회(UTC 0/6/12/18시 첫 Cron)만 — 전용 인덱스를 두면 매 job 상태 변경마다 쓰기가 늘어난다.
   { const t=new Date(); if(t.getUTCHours()%6===0 && t.getUTCMinutes()<15){ try{ await pruneJobs(env); }catch(_){} } }
