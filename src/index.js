@@ -72,10 +72,10 @@ async function humanStats(env,projectId,cycle,humanProtocol=null){
   try{return await one(env.DB,`SELECT
     COALESCE((SELECT reviewer_obs_count FROM projects WHERE id=?),0) observations,
     (SELECT COUNT(*) FROM reviewer_participants_total WHERE project_id=?) participants,
-    (SELECT COUNT(*) FROM reviewer_participants_cycle WHERE project_id=? AND research_cycle=? AND (? IS NULL OR protocol=?)) eligible_participants`,[projectId,projectId,projectId,cycle,humanProtocol,humanProtocol]);}
+    (SELECT COUNT(DISTINCT participant_hash) FROM reviewer_participants_cycle WHERE project_id=? AND (? IS NULL OR protocol=?)) eligible_participants`,[projectId,projectId,projectId,humanProtocol,humanProtocol]);}
   catch{return one(env.DB,`SELECT COUNT(*) observations, COUNT(DISTINCT NULLIF(participant_hash,'anonymous')) participants,
-    COUNT(DISTINCT CASE WHEN (? IS NULL OR (trial_id IS NOT NULL AND json_extract(context_json,'$.protocol')=? AND json_extract(context_json,'$.cycle')=?)) THEN NULLIF(participant_hash,'anonymous') END) eligible_participants
-    FROM reviewer_observations WHERE project_id=?`,[humanProtocol,humanProtocol,cycle,projectId]);}
+    COUNT(DISTINCT CASE WHEN (? IS NULL OR (trial_id IS NOT NULL AND json_extract(context_json,'$.protocol')=?)) THEN NULLIF(participant_hash,'anonymous') END) eligible_participants
+    FROM reviewer_observations WHERE project_id=?`,[humanProtocol,humanProtocol,projectId]);}
 }
 
 async function storageIntegrity(env,pcols=null,knownProjectCount=null){
@@ -243,7 +243,7 @@ async function api(request,env,ctx=null){
       const p=await one(env.DB,`SELECT research_cycle,evidence_revision FROM projects WHERE id=?`,[projectId]); let r=await one(env.DB,`SELECT * FROM reports WHERE project_id=? AND research_cycle=? AND evidence_revision=? AND stale_at IS NULL ORDER BY created_at DESC LIMIT 1`,[projectId,Number(p?.research_cycle||1),Number(p?.evidence_revision||0)]); const stale=!r; if(!r)r=await one(env.DB,`SELECT * FROM reports WHERE project_id=? ORDER BY created_at DESC LIMIT 1`,[projectId]); if(r&&!stale){ try{ r=await upgradeStoredReport(env,projectId,r); }catch(e){ /* 구버전 보고서는 그대로 반환 */ } }
       const hp=await one(env.DB,`SELECT json_extract(content_json,'$.validation.human_protocol') human_protocol FROM definitions WHERE project_id=? ORDER BY version DESC LIMIT 1`,[projectId]);
       const liveHuman=await humanStats(env,projectId,Number(p?.research_cycle||1),hp?.human_protocol||null);
-      const liveNotice=`> 현재 저장된 인간실험: 누적 참가자 ${Number(liveHuman?.participants||0)}명 / 관측 ${Number(liveHuman?.observations||0)}건, 현재 규약·주기 대상 ${Number(liveHuman?.eligible_participants||0)}명.\n> 아래 본문은 보고서 작성 당시의 증거 스냅샷(Cycle ${r?.research_cycle||'-'} · Evidence r${r?.evidence_revision??'-'})입니다.${stale?' 이전 증거 스냅샷 보고서입니다. 최신 보고서는 Actions 실행 후 갱신됩니다.':''} 현재 인원으로 본문의 통계값을 대체하지 않습니다.\n\n`;
+      const liveNotice=`> 현재 저장된 인간실험: 누적 참가자 ${Number(liveHuman?.participants||0)}명 / 관측 ${Number(liveHuman?.observations||0)}건, 현재 인간실험 규약 대상 ${Number(liveHuman?.eligible_participants||0)}명.\n> 아래 본문은 보고서 작성 당시의 증거 스냅샷(Cycle ${r?.research_cycle||'-'} · Evidence r${r?.evidence_revision??'-'})입니다.${stale?' 이전 증거 스냅샷 보고서입니다. 최신 보고서는 Actions 실행 후 갱신됩니다.':''} 현재 인원으로 본문의 통계값을 대체하지 않습니다.\n\n`;
       return r?json({...r,stale,live_human:liveHuman,current_cycle:Number(p?.research_cycle||1),current_revision:Number(p?.evidence_revision||0),content_markdown:liveNotice+r.content_markdown,data:safeJson(r.data_json,{})}):json({error:'report_not_ready'},404);
     }
     if(parts[3]==='report' && method==='POST'){ if(['github-actions','hybrid'].includes(env.COMPUTE_EXECUTOR)){await enqueueOnce(env,projectId,'generate_report',{},95);return json({status:'queued',transport:'github-actions'},202);} return json(await generateReport(env,projectId)); }
