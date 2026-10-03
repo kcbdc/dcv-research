@@ -50,9 +50,26 @@ export async function getValidationMatrix(env,projectId){
   const p=await one(env.DB,`SELECT name,research_cycle,evidence_revision FROM projects WHERE id=?`,[projectId]);if(!p)throw new Error('project_not_found');
   const currentCycle=Number(p.research_cycle||1),currentRev=Number(p.evidence_revision||0);
   let cycle=currentCycle,rev=currentRev,rows=await matrixRows(env,projectId,cycle,rev),stale=false,snapshotUpdatedAt=null;
+
   if(!rows.length){
+    // Normal evidence revalidation must preserve the last known valid matrix until the current
+    // revision has actually been rebuilt. Only when no prior matrix snapshot exists at all
+    // (e.g. migration 0024 deliberately cleared the derived cache after cycle repair) do we
+    // lazily rebuild the current matrix from repaired source data.
     const snap=await one(env.DB,`SELECT research_cycle,evidence_revision,MAX(updated_at) updated_at FROM candidate_validation_matrix WHERE project_id=? AND (research_cycle<? OR (research_cycle=? AND evidence_revision<?)) GROUP BY research_cycle,evidence_revision ORDER BY research_cycle DESC,evidence_revision DESC LIMIT 1`,[projectId,currentCycle,currentCycle,currentRev]);
-    if(snap){ cycle=Number(snap.research_cycle||1);rev=Number(snap.evidence_revision||0);snapshotUpdatedAt=snap.updated_at||null;rows=await matrixRows(env,projectId,cycle,rev);stale=rows.length>0; }
+    if(snap){
+      cycle=Number(snap.research_cycle||1);rev=Number(snap.evidence_revision||0);snapshotUpdatedAt=snap.updated_at||null;
+      rows=await matrixRows(env,projectId,cycle,rev);stale=rows.length>0;
+    }else{
+      const ready=await one(env.DB,`SELECT
+        (SELECT COUNT(*) FROM design_candidates WHERE project_id=? AND research_cycle=?) candidates,
+        COALESCE((SELECT simulation_total FROM project_cycle_stats WHERE project_id=? AND research_cycle=?),0) runs`,
+        [projectId,currentCycle,projectId,currentCycle]);
+      if(Number(ready?.candidates||0)>0 && Number(ready?.runs||0)>0){
+        await refreshValidationMatrix(env,projectId);
+        cycle=currentCycle;rev=currentRev;rows=await matrixRows(env,projectId,cycle,rev);
+      }
+    }
   }
   if(!snapshotUpdatedAt&&rows.length)snapshotUpdatedAt=rows.reduce((m,r)=>String(r.updated_at||'')>String(m||'')?r.updated_at:m,null);
   const summary={total:rows.length,PASS:0,PARTIAL:0,HOLD:0,FAIL:0,NA:0,dimensions:{}};
