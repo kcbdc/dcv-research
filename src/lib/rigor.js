@@ -48,7 +48,7 @@ export async function ensureFrozenProtocol(env,projectId){
   if(latest){
     if(latest.protocol_hash===hash) return {...latest,protocol:safeJson(latest.protocol_json,{})};
     // 해시가 달라졌을 때만, 그리고 COUNT(*) 대신 존재 여부(LIMIT 1)만 확인한다.
-    const started=await one(env.DB,`SELECT 1 x FROM simulation_runs r JOIN design_candidates c ON c.id=r.candidate_id WHERE r.project_id=? AND c.research_cycle=? LIMIT 1`,[projectId,cycle]);
+    const started=await one(env.DB,`SELECT 1 x FROM simulation_runs WHERE project_id=? AND research_cycle=? LIMIT 1`,[projectId,cycle]);
     if(started) throw new Error('protocol_drift_after_simulation_start');
   }
   const id=uid('protocol'),ts=nowIso();

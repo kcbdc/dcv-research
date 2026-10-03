@@ -19,7 +19,7 @@ export async function refreshValidationMatrix(env,projectId){
   const cycle=Number(p.research_cycle||1),rev=Number(p.evidence_revision||0);
   const cands=await all(env.DB,`SELECT id FROM design_candidates WHERE project_id=? AND research_cycle=? ORDER BY id`,[projectId,cycle]);
   if(!cands.length)return {rows:0,cycle,revision:rev};
-  const runs=await all(env.DB,`SELECT r.candidate_id,r.phase,r.result_json FROM simulation_runs r JOIN design_candidates c ON c.id=r.candidate_id WHERE r.project_id=? AND c.research_cycle=? AND r.phase IN ('confirmation','historical','stress') ORDER BY r.created_at DESC`,[projectId,cycle]);
+  const runs=await all(env.DB,`SELECT r.candidate_id,r.phase,r.result_json FROM simulation_runs r WHERE r.project_id=? AND r.research_cycle=? AND r.phase IN ('confirmation','historical','stress') ORDER BY r.created_at DESC`,[projectId,cycle]);
   const runMap=latestByCandidate(runs);
   const humans=await all(env.DB,`SELECT candidate_id,status,result_json FROM validations WHERE project_id=? AND evidence_revision=? AND validation_type='human_recompute' ORDER BY created_at DESC`,[projectId,rev]);
   const humanMap=new Map();for(const h of humans)if(!humanMap.has(h.candidate_id))humanMap.set(h.candidate_id,h);

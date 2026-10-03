@@ -144,9 +144,9 @@ export async function advanceProject(env,projectId){
 
   // 이전: simulation_runs 를 phase 별로 3번, validations 를 3번 — 모두 project_id 인덱스가 없어 전체 스캔.
   // 이후: 커버링 인덱스로 GROUP BY 1회씩.
-  const runAgg=await all(env.DB,`SELECT r.phase,COUNT(DISTINCT r.candidate_id) n FROM simulation_runs r JOIN design_candidates c ON c.id=r.candidate_id WHERE r.project_id=? AND c.research_cycle=? AND r.phase IN ('historical','stress') GROUP BY r.phase`,[projectId,cycle]);
+  const runAgg=await all(env.DB,`SELECT phase,COUNT(DISTINCT candidate_id) n FROM simulation_runs WHERE project_id=? AND research_cycle=? AND phase IN ('historical','stress') GROUP BY phase`,[projectId,cycle]);
   const rn=Object.fromEntries(runAgg.map(r=>[r.phase,Number(r.n||0)]));
-  const recomputeNow=await one(env.DB,`SELECT COUNT(DISTINCT r.candidate_id) n FROM simulation_runs r JOIN design_candidates c ON c.id=r.candidate_id WHERE r.project_id=? AND c.research_cycle=? AND r.phase='recompute' AND r.evidence_revision=?`,[projectId,cycle,rev]);
+  const recomputeNow=await one(env.DB,`SELECT COUNT(DISTINCT candidate_id) n FROM simulation_runs WHERE project_id=? AND research_cycle=? AND phase='recompute' AND evidence_revision=?`,[projectId,cycle,rev]);
   rn.recompute=Number(recomputeNow?.n||0);
   if((rn.historical||0)<feasible || (rn.stress||0)<feasible){
     if(!(await jobExists(env,projectId,'compute_candidate','historical')) && !(await jobExists(env,projectId,'compute_candidate','stress'))) await enqueueRobustValidation(env,projectId);
@@ -312,7 +312,7 @@ export async function scheduleAll(env,{process=true}={}){
     missingReports=await all(env.DB,`SELECT p.id FROM projects p WHERE p.auto_run=1
       AND EXISTS(SELECT 1 FROM definitions d WHERE d.project_id=p.id)
       AND NOT EXISTS(SELECT 1 FROM reports r WHERE r.project_id=p.id AND r.research_cycle=p.research_cycle AND r.evidence_revision=p.evidence_revision AND r.stale_at IS NULL
-        AND r.created_at>=COALESCE((SELECT MAX(sr.created_at) FROM simulation_runs sr JOIN design_candidates dc ON dc.id=sr.candidate_id WHERE sr.project_id=p.id AND dc.research_cycle=p.research_cycle),r.created_at))
+        AND r.created_at>=COALESCE((SELECT MAX(sr.created_at) FROM simulation_runs sr WHERE sr.project_id=p.id AND sr.research_cycle=p.research_cycle),r.created_at))
       AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.project_id=p.id AND j.type='generate_report' AND j.status IN ('queued','running'))
       ORDER BY p.updated_at,p.id LIMIT 4`);
   }
