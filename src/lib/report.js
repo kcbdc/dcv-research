@@ -18,7 +18,7 @@ const estName = e => EST[e] || e;
 export function checklist(t) {
   const items = [], rv = t.reviewer, pn = t.empirical.panel, c = t.candidates, lc=t.empirical.loss_calibration;
   const minP=Number(t.definition.content?.validation?.min_human_participants||30);
-  if (rv.participants < minP) items.push(`현재 규약·연구주기의 인간실험 참가자가 ${rv.participants}명으로 사전 기준 ${minP}명에 미달합니다${rv.cumulative_participants!=null?`(누적 ${rv.cumulative_participants}명)`:''}. 반복 trial 수가 많아도 참가자 수를 대체하지 못합니다.`);
+  if (rv.participants < minP) items.push(`현재 인간실험 규약의 참가자가 ${rv.participants}명으로 사전 기준 ${minP}명에 미달합니다${rv.cumulative_participants!=null?`(누적 ${rv.cumulative_participants}명)`:''}. 반복 trial 수가 많아도 참가자 수를 대체하지 못합니다.`);
   if (!rv.cluster_bootstrap?.B) items.push('반복측정 인간실험의 참가자-군집 bootstrap 불확실성 추정이 아직 없습니다.');
   if (pn.n && pn.estimated / pn.n > 0.5) items.push(`위기 사례 ${pn.n}건 중 reconstructed 자료가 ${pn.estimated}건(${pct(pn.estimated / pn.n, 0)})입니다. 결과는 이 재구성 규칙에 조건부임을 본문과 표에 유지하십시오.`);
   if (t.empirical.readiness !== 'FULL_EPISODE_PANEL') items.push(`실증 패널이 완전하지 않습니다(${t.empirical.complete_rows}/${t.empirical.target_rows}).`);
@@ -55,7 +55,7 @@ function fallbackNarrative(t) {
     top?.share > 0 ? `추정기별로는 ${estName(top.estimator)}의 위임 가능 비율이 ${pct(top.share)}로 가장 높았다(표 6). 다만 후보 수가 추정기마다 제한적이므로 신뢰구간의 폭을 함께 고려해야 한다.` : '',
     `현재 τ 수준은 ${[...new Set(c.list.map(x=>x.tau))].join(', ')}, d 수준은 ${[...new Set(c.list.map(x=>x.d))].join(', ')}이다. 한 수준뿐이면 해당 지연의 효과와 상호작용은 식별할 수 없다. K0/K1은 정의상 전량 검토이므로 B 상한이 1 미만일 때의 탈락은 실증 발견이 아니다. 추정기별 주변 비율은 신뢰도 정의와 base 공변량 차이에 조건부이며, 동일 환경의 신뢰도 절제 결과와 교정오차를 함께 확인해야 한다.`,
     `σ와 α의 상호작용은 그림 1과 표 5에 나타난 바와 같이 정보오차가 커질수록 위임 가능 비율이 어떻게 달라지는지를 보여 준다.`,
-    rv.n ? `인간 관측의 표본은 ${rv.participants}명으로, 30명 기준 ${rv.participants>=30?'충족':'미달'}이다. 기록에서 AI 오답 수용률은 AI 오답 수용률은 ${pct(rv.false_accept.p)}, 정정 개입률은 ${pct(rv.correct_override.p)}였다. 이 비율을 시뮬레이션에 실제 반영했는지는 현재 revision의 검토자 모델과 재계산 기록으로 확인해야 하며 관측 수만으로 반영을 주장하지 않는다.` : `누적 참가자 ${rv.cumulative_participants||0}명, 기록 ${rv.cumulative_trials||0}건은 보존되어 있다. 현재 규약·연구 주기에 적합한 관측이 없어 인간 행동 보정은 대기 중이다.`
+    rv.n ? `인간 관측의 표본은 ${rv.participants}명으로, 30명 기준 ${rv.participants>=30?'충족':'미달'}이다. 기록에서 AI 오답 수용률은 AI 오답 수용률은 ${pct(rv.false_accept.p)}, 정정 개입률은 ${pct(rv.correct_override.p)}였다. 이 비율을 시뮬레이션에 실제 반영했는지는 현재 revision의 검토자 모델과 재계산 기록으로 확인해야 하며 관측 수만으로 반영을 주장하지 않는다.` : `누적 참가자 ${rv.cumulative_participants||0}명, 기록 ${rv.cumulative_trials||0}건은 보존되어 있다. 현재 인간실험 규약에 적합한 관측이 없어 인간 행동 보정은 대기 중이다.`
   ].filter(Boolean).join(' ');
   return { abstract, discussion, implications: [['COMPUTATIONALLY_CONFIRMED','SCIENTIFICALLY_APPROVED'].includes(decision) ? '제시된 제약과 검증 프로토콜 하에서 위임이 가능한 설계 영역이 존재함을 보였다.' : '현재 증거만으로는 위임 가능 영역을 확정하기 어렵다.', '설계 변수(σ, α, K, d)를 함께 조정해야 위임 경계를 설명할 수 있다.'], next_steps: ['실제 손실함수와 사례별 모수 보정으로 계산 엔진 교체', '검토자 표본 확대와 참가자 간 이질성 분석', '경계 근처 후보의 반복 시드 검증'] };
 }
@@ -116,8 +116,8 @@ export function buildMarkdown(t, ai, sourceNote) {
 
   L.push('## 6. 인간 검토자 보정', '');
   if (rv.n) {
-    L.push(`누적 참가자 ${rv.cumulative_participants||rv.participants}명 / 기록 ${rv.cumulative_trials||rv.n}건. 현재 규약·주기 분석: 검토자 관측 ${rv.n}건(참가자 ${rv.participants}명), 평균 응답시간 ${f(rv.mean_rt_ms / 1000, 2)}초. 반복 trial을 독립 참가자로 간주하지 않고 참가자 단위 cluster bootstrap 기록은 ${rv.cluster_bootstrap?.B||0}회이다. 0회이면 적용된 구간이 없으며 아래 Wilson 구간은 trial 수준의 기술통계다.`, '', '**표 10. 인간 검토자 행동 모수 (95% Wilson 구간)**', '', mdTable(['지표', '추정치 [95% CI]'], [['적정 의존율 (ARR)', cip(rv.arr)], ['AI 오답 수용률', cip(rv.false_accept)], ['정정 개입률 (AI 오답 개입)', cip(rv.correct_override)], ['불필요 개입률 (AI 정답 개입)', cip(rv.unnecessary_override)]]), '', '**표 11. AI 신뢰도별 수용률**', '', mdTable(['AI 신뢰도', 'n', '실제 정답률', '정답 시 수용', '오답 시 수용', '평균 응답시간(ms)'], rv.by_confidence.map(x => [x.confidence, x.n, pct(x.n?x.correct_n/x.n:null), cip(x.accept_when_correct), cip(x.accept_when_wrong), f(x.mean_rt_ms, 0)])), '', figLine(4));
-  } else L.push(`현재 분석 대상 검토자 관측이 없습니다. 누적 참가자 ${rv.cumulative_participants||0}명 / 관측 ${rv.cumulative_trials||0}건은 보존되어 있습니다. 현재 규약·주기에 부합하지 않는 ${rv.excluded_trials||0}건은 분석에서 제외됩니다.`, '');
+    L.push(`누적 참가자 ${rv.cumulative_participants||rv.participants}명 / 기록 ${rv.cumulative_trials||rv.n}건. 현재 인간실험 규약 분석: 검토자 관측 ${rv.n}건(참가자 ${rv.participants}명), 평균 응답시간 ${f(rv.mean_rt_ms / 1000, 2)}초. 반복 trial을 독립 참가자로 간주하지 않고 참가자 단위 cluster bootstrap 기록은 ${rv.cluster_bootstrap?.B||0}회이다. 0회이면 적용된 구간이 없으며 아래 Wilson 구간은 trial 수준의 기술통계다.`, '', '**표 10. 인간 검토자 행동 모수 (95% Wilson 구간)**', '', mdTable(['지표', '추정치 [95% CI]'], [['적정 의존율 (ARR)', cip(rv.arr)], ['AI 오답 수용률', cip(rv.false_accept)], ['정정 개입률 (AI 오답 개입)', cip(rv.correct_override)], ['불필요 개입률 (AI 정답 개입)', cip(rv.unnecessary_override)]]), '', '**표 11. AI 신뢰도별 수용률**', '', mdTable(['AI 신뢰도', 'n', '실제 정답률', '정답 시 수용', '오답 시 수용', '평균 응답시간(ms)'], rv.by_confidence.map(x => [x.confidence, x.n, pct(x.n?x.correct_n/x.n:null), cip(x.accept_when_correct), cip(x.accept_when_wrong), f(x.mean_rt_ms, 0)])), '', figLine(4));
+  } else L.push(`현재 분석 대상 검토자 관측이 없습니다. 누적 참가자 ${rv.cumulative_participants||0}명 / 관측 ${rv.cumulative_trials||0}건은 보존되어 있습니다. 현재 인간실험 규약에 부합하지 않는 ${rv.excluded_trials||0}건은 분석에서 제외됩니다.`, '');
 
   if(rv.n)L.push(`참가자별 관측 수: 최소 ${Math.min(...(rv.participant_distribution||[0]))}, 최대 ${Math.max(...(rv.participant_distribution||[0]))}; 최다 참가자 비중 ${pct(Math.max(...(rv.participant_distribution||[0]))/rv.n)}. 인간 과제 프로토콜: ${rv.protocol||'legacy'}. 통제 과제 신뢰도는 설계상 정답확률이며 실제 AI 성능 추정과 구분한다.`, '', '**참가자 cluster bootstrap 구간 (기술통계)**', '', mdTable(['모수','하한','상한'],Object.entries(rv.cluster_bootstrap?.ci95||{}).map(([k,q])=>[k,f(q.lo),f(q.hi)])), '');
   L.push('## 7. 최종 판정', '', t.approval ? `- 판정: **${t.approval.decision}** (Evidence Level ${t.approval.evidence_level}, ${t.approval.automatic ? '계산 자동판정' : '사람의 학술 승인'}, ${t.approval.created_at})` : '- 판정: 미확정', b ? `- 선택 후보: 추정기 ${estName(b.estimator)}, σ=${b.sigma}, τ=${b.tau}, α=${b.alpha}, K=${b.K}, d=${b.d}, W=${b.W}, m=${b.m}\n- Minimax Regret ${f(b.max_regret, 4)}, Boundary Score ${f(b.boundary_score)}` : '', t.approval?.basis?.selection_rule ? `- 선택 규칙: ${t.approval.basis.selection_rule}` : '', '');
@@ -137,7 +137,7 @@ export function buildMarkdown(t, ai, sourceNote) {
   return L.join('\n');
 }
 
-export async function generateReport(env, projectId, {checkpoint=false}={}) {
+export async function generateReport(env, projectId) {
   const t = await buildThesisData(env, projectId), base = fallbackNarrative(t);
   base.limitations = [...(rvLimit(t)), '시뮬레이션 기반 결과이며 실제 제도 환경으로의 일반화에는 추가 검증이 필요하다.'];
   const ai = await aiJson(env,
@@ -151,25 +151,18 @@ export async function generateReport(env, projectId, {checkpoint=false}={}) {
   const proj=await one(env.DB,`SELECT research_cycle,evidence_revision FROM projects WHERE id=?`,[projectId]);
   const snapshotCycle=Number(t.project.research_cycle||1),snapshotRevision=Number(t.project.evidence_revision||0);
   const scopeChanged=Number(proj?.research_cycle||1)!==snapshotCycle||Number(proj?.evidence_revision||0)!==snapshotRevision;
-  const evaluatedCandidates=Math.max(0,Number(t.candidates.total||0)-Number(t.candidates.by_class.unevaluated||0));
-  const reportKind=checkpoint?'paper_summary_checkpoint':'paper_summary';
-  const reportTitle=checkpoint?`${p?.name || 'DCV'} 연구결과 · 중간 업데이트 (${evaluatedCandidates}/${t.candidates.total})`:`${p?.name || 'DCV'} 연구결과`;
-  await run(env.DB, `INSERT INTO reports(id,project_id,kind,title,content_markdown,data_json,created_at,research_cycle,evidence_revision) VALUES(?,?,?,?,?,?,?,?,?)`, [id, projectId, reportKind, reportTitle, md, JSON.stringify({ ai_meta: ai._ai, narrative: merged, checklist: checklist(t), figures: figureCatalog(t), summary: { decision: t.approval?.decision, candidates: t.candidates.total, evaluated_candidates:evaluatedCandidates, unevaluated_candidates:Number(t.candidates.by_class.unevaluated||0), confirmed: t.candidates.by_class.confirmed, reviewer_n: t.reviewer.n, checkpoint } }), nowIso(),snapshotCycle,snapshotRevision]);
+  await run(env.DB, `INSERT INTO reports(id,project_id,kind,title,content_markdown,data_json,created_at,research_cycle,evidence_revision) VALUES(?,?,?,?,?,?,?,?,?)`, [id, projectId, 'paper_summary', `${p?.name || 'DCV'} 연구결과`, md, JSON.stringify({ ai_meta: ai._ai, narrative: merged, checklist: checklist(t), figures: figureCatalog(t), summary: { decision: t.approval?.decision, candidates: t.candidates.total, confirmed: t.candidates.by_class.confirmed, reviewer_n: t.reviewer.n } }), nowIso(),snapshotCycle,snapshotRevision]);
   if(scopeChanged){await run(env.DB,`UPDATE reports SET stale_at=? WHERE id=?`,[nowIso(),id]);return {id,draft:true,stale:true,content_markdown:md,markdown:md};}
   const incomplete=(t.candidates.by_class.unevaluated||0)>0 || !t.candidates.total || !['COMPUTATIONALLY_CONFIRMED','SCIENTIFICALLY_APPROVED'].includes(t.approval?.decision);
   const signed=await one(env.DB, `SELECT id FROM approvals WHERE project_id=? AND research_cycle=? AND evidence_revision=? AND stale_at IS NULL AND decision='SCIENTIFICALLY_APPROVED' ORDER BY created_at DESC LIMIT 1`, [projectId,Number(proj?.research_cycle||1),Number(proj?.evidence_revision||0)]);
-  if(checkpoint){
-    await run(env.DB, `UPDATE projects SET current_stage='compute',status='running',updated_at=? WHERE id=?`, [nowIso(),projectId]);
-  }else{
-    await run(env.DB, `UPDATE projects SET current_stage=?,status=?,updated_at=? WHERE id=?`, [incomplete?'compute':signed?'complete':'scientific_review',incomplete?'running':signed?'complete':'report_ready',nowIso(), projectId]);
-  }
-  await audit(env, projectId, 'agent', checkpoint?'report.checkpoint.generated':'report.generated', 'report', id, { approval: t.approval?.decision, ai: ai._ai, evaluated_candidates:evaluatedCandidates, checkpoint });
-  return { id, draft:checkpoint||incomplete, checkpoint, evaluated_candidates:evaluatedCandidates, markdown: md, content_markdown: md, thesis: t, ai };
+  await run(env.DB, `UPDATE projects SET current_stage=?,status=?,updated_at=? WHERE id=?`, [incomplete?'compute':signed?'complete':'scientific_review',incomplete?'running':signed?'complete':'report_ready',nowIso(), projectId]);
+  await audit(env, projectId, 'agent', 'report.generated', 'report', id, { approval: t.approval?.decision, ai: ai._ai });
+  return { id, draft:incomplete, markdown: md, content_markdown: md, thesis: t, ai };
 }
 
 function rvLimit(t) {
   const L = [], rv = t.reviewer, pn = t.empirical.panel, lc=t.empirical.loss_calibration;
-  if(rv.n) L.push(`인간 검토 결과는 ${rv.n}개 trial, ${rv.participants}명 참가자에 기반한다. 반복측정 의존성은 참가자 cluster bootstrap으로 보정하지만 표본의 대표성 문제는 별개로 남는다.`); else L.push(`누적 참가자 ${rv.cumulative_participants||0}명의 기록은 보존되어 있으나 현재 규약·주기의 분석 대상은 ${rv.participants}명이다.`);
+  if(rv.n) L.push(`인간 검토 결과는 ${rv.n}개 trial, ${rv.participants}명 참가자에 기반한다. 반복측정 의존성은 참가자 cluster bootstrap으로 보정하지만 표본의 대표성 문제는 별개로 남는다.`); else L.push(`누적 참가자 ${rv.cumulative_participants||0}명의 기록은 보존되어 있으나 현재 인간실험 규약의 분석 대상은 ${rv.participants}명이다.`);
   if (pn.n) L.push(`위기 사례 ${pn.n}건 중 ${pn.estimated}건은 reconstructed 자료로, 계수 정밀도와 외적 타당성은 재구성 규칙에 조건부이다.`);
   if(lc?.identification_status==='PROXY_ONLY') L.push('FP/FN 손실계수는 직접 관측 비용이 아니라 peak-outflow 기반 proxy이며, proxy 범위 민감도는 검증하지만 경제적 후생비용으로 해석할 수 없다.');
   L.push('후보 수준별 비율은 주변 비율이며 변수 간 상호작용과 인과효과를 직접 식별하지 못한다.');

@@ -251,12 +251,12 @@ export async function buildThesisData(env, projectId) {
   // 인간 검토자: reviewer_observations 를 한 번만 스캔한다(이전: 전체 집계 + 신뢰도별 집계로 2회 스캔).
   // (신뢰도 구간 × 참가자)로 묶어 가져오면 행 수는 구간수×참가자수로 줄고, 합계·참가자 수·구간별 값을 모두 여기서 만든다.
   const humanProtocol=content.validation?.human_protocol||null;
-  const humanGroups = await all(env.DB, `SELECT CASE WHEN ? IS NULL OR (trial_id IS NOT NULL AND json_extract(context_json,'$.protocol')=? AND json_extract(context_json,'$.cycle')=?) THEN 1 ELSE 0 END eligible, ROUND(ai_confidence,2) confidence, participant_hash ph, COUNT(*) n, SUM(response_ms) rt,
+  const humanGroups = await all(env.DB, `SELECT CASE WHEN ? IS NULL OR (trial_id IS NOT NULL AND json_extract(context_json,'$.protocol')=?) THEN 1 ELSE 0 END eligible, ROUND(ai_confidence,2) confidence, participant_hash ph, COUNT(*) n, SUM(response_ms) rt,
     SUM(CASE WHEN ai_correct=1 THEN 1 ELSE 0 END) correct_n, SUM(CASE WHEN ai_correct=1 AND human_accept=1 THEN 1 ELSE 0 END) acc_c,
     SUM(CASE WHEN ai_correct=0 THEN 1 ELSE 0 END) wrong_n, SUM(CASE WHEN ai_correct=0 AND human_accept=1 THEN 1 ELSE 0 END) acc_w,
     SUM(CASE WHEN ai_correct=1 AND human_accept=0 THEN 1 ELSE 0 END) right_override,
     SUM(CASE WHEN (ai_correct=1 AND human_accept=1) OR (ai_correct=0 AND human_accept=0) THEN 1 ELSE 0 END) appropriate
-    FROM reviewer_observations WHERE project_id=? GROUP BY eligible, ROUND(ai_confidence,2), participant_hash`, [humanProtocol,humanProtocol,cycle,projectId]);
+    FROM reviewer_observations WHERE project_id=? GROUP BY eligible, ROUND(ai_confidence,2), participant_hash`, [humanProtocol,humanProtocol,projectId]);
   const rvRows=humanGroups.filter(r=>Number(r.eligible)===1);
   const cumulativeParticipants=new Set(humanGroups.map(r=>r.ph).filter(p=>p && p!=='anonymous'));
   const cumulativeTrials=humanGroups.reduce((n,r)=>n+Number(r.n||0),0);
@@ -273,7 +273,7 @@ export async function buildThesisData(env, projectId) {
   const N = k => Number(rvTot?.[k] || 0);
   const byConfidence = confRows.map(e => ({ confidence: Number(e.confidence), n: e.n, correct_n: Number(e.correct_n), wrong_n: Number(e.wrong_n), accept_when_correct: ci(Number(e.acc_c), Number(e.correct_n)), accept_when_wrong: ci(Number(e.acc_w), Number(e.wrong_n)), mean_rt_ms: r4(e.mean_rt) }));
   const reviewer = {
-    n: N('n'), participants: N('participants'), cumulative_participants:cumulativeParticipants.size, cumulative_trials:cumulativeTrials, excluded_trials:cumulativeTrials-N('n'), exclusion_note:'현재 규약·연구 주기에 부합하지 않는 과거 기록은 보존하되 현재 분석에서 제외합니다.',
+    n: N('n'), participants: N('participants'), cumulative_participants:cumulativeParticipants.size, cumulative_trials:cumulativeTrials, excluded_trials:cumulativeTrials-N('n'), exclusion_note:'현재 인간실험 규약에 부합하지 않는 과거 기록은 보존하되 현재 분석에서 제외합니다.',
     arr: ci(N('appropriate'), N('n')), false_accept: ci(N('wrong_accept'), N('wrong_n')), correct_override: ci(N('wrong_n') - N('wrong_accept'), N('wrong_n')), unnecessary_override: ci(N('right_override'), N('right_n')),
     mean_rt_ms: r4(rvTot?.mean_rt), by_confidence: byConfidence, model: safeJson(rmodel?.model_json, null), model_version: rmodel?.version ?? null, cluster_bootstrap: safeJson(rmodel?.model_json, null)?.cluster_bootstrap || clusterBootstrapGrouped(rvRows),protocol:humanProtocol||'legacy',participant_distribution:[...rvRows.reduce((m,r)=>m.set(r.ph,(m.get(r.ph)||0)+Number(r.n)),new Map()).values()]
   };
