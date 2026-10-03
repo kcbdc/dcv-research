@@ -42,14 +42,14 @@ ON CONFLICT(project_id,research_cycle) DO UPDATE SET
   boundary_count=excluded.boundary_count,regret_updated_at=excluded.regret_updated_at;
 
 INSERT INTO project_cycle_stats(project_id,research_cycle,simulation_total,simulation_exploration,simulation_refinement,simulation_confirmation,simulation_robust,latest_simulation_at)
-SELECT r.project_id,c.research_cycle,COUNT(*),
+SELECT r.project_id,COALESCE(r.research_cycle,c.research_cycle,1),COUNT(*),
   SUM(CASE WHEN r.phase='exploration' THEN 1 ELSE 0 END),
   SUM(CASE WHEN r.phase='refinement' THEN 1 ELSE 0 END),
   SUM(CASE WHEN r.phase='confirmation' THEN 1 ELSE 0 END),
   SUM(CASE WHEN r.phase IN ('historical','stress') THEN 1 ELSE 0 END),
   MAX(r.created_at)
 FROM simulation_runs r JOIN design_candidates c ON c.id=r.candidate_id
-GROUP BY r.project_id,c.research_cycle
+GROUP BY r.project_id,COALESCE(r.research_cycle,c.research_cycle,1)
 ON CONFLICT(project_id,research_cycle) DO UPDATE SET
   simulation_total=excluded.simulation_total,simulation_exploration=excluded.simulation_exploration,
   simulation_refinement=excluded.simulation_refinement,simulation_confirmation=excluded.simulation_confirmation,
@@ -104,19 +104,16 @@ CREATE TRIGGER IF NOT EXISTS trg_candidate_stats_delete AFTER DELETE ON design_c
 END;
 
 CREATE TRIGGER IF NOT EXISTS trg_sim_stats_insert AFTER INSERT ON simulation_runs BEGIN
-  INSERT INTO project_cycle_stats(project_id,research_cycle,simulation_total,simulation_exploration,simulation_refinement,simulation_confirmation,simulation_robust,latest_simulation_at)
-  VALUES(NEW.project_id,COALESCE((SELECT research_cycle FROM design_candidates WHERE id=NEW.candidate_id),1),1,
-    CASE WHEN NEW.phase='exploration' THEN 1 ELSE 0 END,
-    CASE WHEN NEW.phase='refinement' THEN 1 ELSE 0 END,
-    CASE WHEN NEW.phase='confirmation' THEN 1 ELSE 0 END,
-    CASE WHEN NEW.phase IN ('historical','stress') THEN 1 ELSE 0 END,NEW.created_at)
-  ON CONFLICT(project_id,research_cycle) DO UPDATE SET
+  INSERT OR IGNORE INTO project_cycle_stats(project_id,research_cycle)
+  VALUES(NEW.project_id,COALESCE(NEW.research_cycle,1));
+  UPDATE project_cycle_stats SET
     simulation_total=simulation_total+1,
-    simulation_exploration=simulation_exploration+excluded.simulation_exploration,
-    simulation_refinement=simulation_refinement+excluded.simulation_refinement,
-    simulation_confirmation=simulation_confirmation+excluded.simulation_confirmation,
-    simulation_robust=simulation_robust+excluded.simulation_robust,
-    latest_simulation_at=CASE WHEN latest_simulation_at IS NULL OR excluded.latest_simulation_at>latest_simulation_at THEN excluded.latest_simulation_at ELSE latest_simulation_at END;
+    simulation_exploration=simulation_exploration+(CASE WHEN NEW.phase='exploration' THEN 1 ELSE 0 END),
+    simulation_refinement=simulation_refinement+(CASE WHEN NEW.phase='refinement' THEN 1 ELSE 0 END),
+    simulation_confirmation=simulation_confirmation+(CASE WHEN NEW.phase='confirmation' THEN 1 ELSE 0 END),
+    simulation_robust=simulation_robust+(CASE WHEN NEW.phase IN ('historical','stress') THEN 1 ELSE 0 END),
+    latest_simulation_at=CASE WHEN latest_simulation_at IS NULL OR NEW.created_at>latest_simulation_at THEN NEW.created_at ELSE latest_simulation_at END
+  WHERE project_id=NEW.project_id AND research_cycle=COALESCE(NEW.research_cycle,1);
 END;
 
 CREATE TRIGGER IF NOT EXISTS trg_sim_stats_delete AFTER DELETE ON simulation_runs BEGIN
@@ -126,7 +123,7 @@ CREATE TRIGGER IF NOT EXISTS trg_sim_stats_delete AFTER DELETE ON simulation_run
     simulation_refinement=MAX(0,simulation_refinement-(CASE WHEN OLD.phase='refinement' THEN 1 ELSE 0 END)),
     simulation_confirmation=MAX(0,simulation_confirmation-(CASE WHEN OLD.phase='confirmation' THEN 1 ELSE 0 END)),
     simulation_robust=MAX(0,simulation_robust-(CASE WHEN OLD.phase IN ('historical','stress') THEN 1 ELSE 0 END))
-  WHERE project_id=OLD.project_id AND research_cycle=COALESCE((SELECT research_cycle FROM design_candidates WHERE id=OLD.candidate_id),1);
+  WHERE project_id=OLD.project_id AND research_cycle=COALESCE(OLD.research_cycle,1);
 END;
 
 -- Distinct human participant registries: dashboard counts become a few index rows instead of

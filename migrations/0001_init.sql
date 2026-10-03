@@ -98,6 +98,7 @@ CREATE TABLE IF NOT EXISTS simulation_runs (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL,
   candidate_id TEXT NOT NULL,
+  research_cycle INTEGER NOT NULL DEFAULT 1,
   phase TEXT NOT NULL,
   seed INTEGER NOT NULL,
   n INTEGER NOT NULL,
