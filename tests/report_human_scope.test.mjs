@@ -5,12 +5,13 @@ import {seedProject} from './helpers/seed.mjs';
 import {buildThesisData} from '../src/lib/thesis.js';
 import {generateReport} from '../src/lib/report.js';
 import {scheduleAll} from '../src/lib/orchestrator.js';
-test('historical participants remain visible without promoting incompatible trials',async()=>{
+test('legacy untagged participants carry forward while explicitly incompatible protocols stay excluded',async()=>{
  const DB=makeDb(),id=await seedProject(DB,{reviewer:60,candidates:0,episodes:0});
  DB.raw.exec("UPDATE reviewer_observations SET participant_hash=id");
  const d=DB.raw.prepare('SELECT content_json FROM definitions').get();const content=JSON.parse(d.content_json);content.validation={human_protocol:'calibrated_task_v2'};DB.raw.prepare('UPDATE definitions SET content_json=?').run(JSON.stringify(content));
- const t=await buildThesisData({DB},id);assert.equal(t.reviewer.cumulative_participants,60);assert.equal(t.reviewer.cumulative_trials,60);assert.equal(t.reviewer.participants,0);assert.equal(t.reviewer.excluded_trials,60);
- const report=await generateReport({DB},id);assert.match(report.content_markdown,/누적 참가자 60명/);assert.equal(DB.raw.prepare('SELECT COUNT(*) n FROM reviewer_observations').get().n,60);
+ DB.raw.prepare("UPDATE reviewer_observations SET context_json=json_object('protocol','older-explicit-protocol') WHERE rowid=(SELECT rowid FROM reviewer_observations LIMIT 1)").run();
+ const t=await buildThesisData({DB},id);assert.equal(t.reviewer.cumulative_participants,60);assert.equal(t.reviewer.cumulative_trials,60);assert.equal(t.reviewer.participants,59);assert.equal(t.reviewer.excluded_trials,1);assert.equal(t.reviewer.legacy_untagged_trials,59);
+ const report=await generateReport({DB},id);assert.match(report.content_markdown,/누적 참가자 60명/);assert.match(report.content_markdown,/legacy 무태그 관측 59건/);assert.equal(DB.raw.prepare('SELECT COUNT(*) n FROM reviewer_observations').get().n,60);
 });
 test('automatic draft report is queued before final approval and coalesced',async()=>{
  const DB=makeDb(),id=await seedProject(DB,{reviewer:0,candidates:0,episodes:0});await scheduleAll({DB},{process:false});await scheduleAll({DB},{process:false});

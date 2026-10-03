@@ -73,3 +73,13 @@ test('External Validation Matrix preserves last valid snapshot while a new evide
   assert.equal(vm.rows[0].synthetic_status,'PASS');
   assert.equal(vm.stale_reason,'CURRENT_REVISION_REVALIDATION_PENDING');
 });
+
+
+test('Figure 3 shows an explicit wait state and preserves tiny regret precision', async()=>{
+  const {buildFigures}=await import('../public/figures.js');
+  const base={reviewer:{by_confidence:[]},empirical:{panel:{n:0,episodes:[]}},validation_matrix:{rows:[]},survival_funnel:{stages:[]},project:{name:'p',research_cycle:1,evidence_revision:1}};
+  let figs=buildFigures({...base,candidates:{cells:[],estimators:[],finalists:[{id:'a',estimator:'ema',sigma:.1,alpha:.35,K:2,d:0,max_regret:null}]}});
+  let f=figs.find(x=>x.n===3);assert.ok(f);assert.match(f.svg,/Minimax Regret 계산 대기/);
+  figs=buildFigures({...base,candidates:{cells:[],estimators:[],finalists:[{id:'a',estimator:'ema',sigma:.1,alpha:.35,K:2,d:0,max_regret:.00001234},{id:'b',estimator:'kalman',sigma:.2,alpha:.35,K:2,d:1,max_regret:.00004567}]}});
+  f=figs.find(x=>x.n===3);assert.ok(f);assert.match(f.svg,/1\.23e-5|0\.000012/);assert.ok(!/>0<\/text>.*>0<\/text>.*>0<\/text>/.test(f.svg));
+});
