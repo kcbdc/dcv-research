@@ -49,9 +49,35 @@ export async function recoverHybridStall(env,{reason='self_heal'}={}){
   return {status:'worker_emergency',dispatch,age_seconds:ageSeconds,results,runner:status};
 }
 
+const tableColumnCache=new Map();
 async function tableColumns(db, table){
-  try{return new Set((await all(db,`PRAGMA table_info(${table})`)).map(x=>x.name));}catch{return new Set();}
+  if(tableColumnCache.has(table)) return tableColumnCache.get(table);
+  try{const cols=new Set((await all(db,`PRAGMA table_info(${table})`)).map(x=>x.name));tableColumnCache.set(table,cols);return cols;}catch{return new Set();}
 }
+async function cycleStats(env,projectId,cycle){
+  try{
+    const s=await one(env.DB,`SELECT candidate_total total,candidate_pending unevaluated,candidate_feasible feasible,candidate_infeasible infeasible,candidate_unresolved unresolved,boundary_sum,boundary_count,simulation_total,simulation_exploration,simulation_refinement,simulation_confirmation,simulation_robust,latest_simulation_at,regret_updated_at FROM project_cycle_stats WHERE project_id=? AND research_cycle=?`,[projectId,cycle]);
+    if(s){
+      const min=await one(env.DB,`SELECT max_regret,updated_at FROM design_candidates WHERE project_id=? AND research_cycle=? AND max_regret IS NOT NULL ORDER BY max_regret,id LIMIT 1`,[projectId,cycle]);
+      return {...s,avg_boundary:Number(s.boundary_count||0)>0?Number(s.boundary_sum||0)/Number(s.boundary_count):null,min_regret:min?.max_regret??null,regret_updated_at:s.regret_updated_at||min?.updated_at||null};
+    }
+  }catch{}
+  const fallback=await env.DB.batch([
+    env.DB.prepare(`SELECT COUNT(*) total,SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) unevaluated,SUM(CASE WHEN status='confirmed_feasible' THEN 1 ELSE 0 END) feasible,SUM(CASE WHEN status IN ('infeasible','confirmation_failed') THEN 1 ELSE 0 END) infeasible,SUM(CASE WHEN evidence_status='UNRESOLVED' THEN 1 ELSE 0 END) unresolved,AVG(boundary_score) avg_boundary,MIN(max_regret) min_regret,MAX(CASE WHEN max_regret IS NOT NULL THEN updated_at END) regret_updated_at FROM design_candidates WHERE project_id=? AND research_cycle=?`).bind(projectId,cycle),
+    env.DB.prepare(`SELECT COUNT(*) simulation_total,SUM(CASE WHEN r.phase='exploration' THEN 1 ELSE 0 END) simulation_exploration,SUM(CASE WHEN r.phase='refinement' THEN 1 ELSE 0 END) simulation_refinement,SUM(CASE WHEN r.phase='confirmation' THEN 1 ELSE 0 END) simulation_confirmation,SUM(CASE WHEN r.phase IN ('historical','stress') THEN 1 ELSE 0 END) simulation_robust,MAX(r.created_at) latest_simulation_at FROM simulation_runs r JOIN design_candidates c ON c.id=r.candidate_id WHERE r.project_id=? AND c.research_cycle=?`).bind(projectId,cycle)
+  ]);
+  return {...(fallback[0]?.results?.[0]||{}),...(fallback[1]?.results?.[0]||{})};
+}
+async function humanStats(env,projectId,cycle,humanProtocol=null){
+  try{return await one(env.DB,`SELECT
+    COALESCE((SELECT reviewer_obs_count FROM projects WHERE id=?),0) observations,
+    (SELECT COUNT(*) FROM reviewer_participants_total WHERE project_id=?) participants,
+    (SELECT COUNT(*) FROM reviewer_participants_cycle WHERE project_id=? AND research_cycle=? AND (? IS NULL OR protocol=?)) eligible_participants`,[projectId,projectId,projectId,cycle,humanProtocol,humanProtocol]);}
+  catch{return one(env.DB,`SELECT COUNT(*) observations, COUNT(DISTINCT NULLIF(participant_hash,'anonymous')) participants,
+    COUNT(DISTINCT CASE WHEN (? IS NULL OR (trial_id IS NOT NULL AND json_extract(context_json,'$.protocol')=? AND json_extract(context_json,'$.cycle')=?)) THEN NULLIF(participant_hash,'anonymous') END) eligible_participants
+    FROM reviewer_observations WHERE project_id=?`,[humanProtocol,humanProtocol,cycle,projectId]);}
+}
+
 async function storageIntegrity(env,pcols=null,knownProjectCount=null){
   pcols=pcols||await tableColumns(env.DB,'projects');
   let projectCount=knownProjectCount==null?0:Number(knownProjectCount),lineage=null;
@@ -115,11 +141,11 @@ async function api(request,env,ctx=null){
     }
     if(parts.length===3 && method==='GET'){
       const p=await one(env.DB,`SELECT * FROM projects WHERE id=?`,[projectId]); if(!p)return json({error:'not_found'},404);
-      if(ctx&&String(env.COMPUTE_EXECUTOR||'')==='hybrid') ctx.waitUntil(recoverHybridStall(env,{reason:'project_detail_poll'}).catch(()=>null));
       const def=await one(env.DB,`SELECT status,version,gate_json,content_json,ai_note,created_at FROM definitions WHERE project_id=? ORDER BY version DESC LIMIT 1`,[projectId]);
       const meas=await one(env.DB,`SELECT metrics_json,quality_json,measured_at FROM measurements WHERE project_id=? ORDER BY measured_at DESC LIMIT 1`,[projectId]);
       const cycle=Number(p.research_cycle||1),rev=Number(p.evidence_revision||0);
-      const counts=await one(env.DB,`SELECT COUNT(*) total,SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) unevaluated,SUM(CASE WHEN status='confirmed_feasible' THEN 1 ELSE 0 END) feasible,SUM(CASE WHEN status IN ('infeasible','confirmation_failed') THEN 1 ELSE 0 END) infeasible,SUM(CASE WHEN evidence_status='UNRESOLVED' THEN 1 ELSE 0 END) unresolved,AVG(boundary_score) avg_boundary,MIN(max_regret) min_regret,MAX(CASE WHEN max_regret IS NOT NULL THEN updated_at END) regret_updated_at FROM design_candidates WHERE project_id=? AND research_cycle=?`,[projectId,cycle]);
+      const counts=await cycleStats(env,projectId,cycle);
+
       let regretMeta={basis:'Historical + Stress (Adversarial + BIS + ECB)',scenario_count:0,historical_scenarios:0,stress_scenarios:0,adversarial_scenarios:0,bis_scenarios:0,ecb_scenarios:0,last_updated_at:counts?.regret_updated_at||null,human_included:false};
       if(counts?.min_regret!=null){
         const rc=await one(env.DB,`SELECT id FROM design_candidates WHERE project_id=? AND research_cycle=? AND max_regret IS NOT NULL ORDER BY max_regret ASC,id LIMIT 1`,[projectId,cycle]);
@@ -136,15 +162,20 @@ async function api(request,env,ctx=null){
       const staleApproval=await one(env.DB,`SELECT * FROM approvals WHERE project_id=? AND stale_at IS NOT NULL ORDER BY stale_at DESC LIMIT 1`,[projectId]);
       const reviewer=await one(env.DB,`SELECT model_json,version,created_at FROM reviewer_models WHERE project_id=? AND research_cycle=? AND evidence_revision=? ORDER BY version DESC LIMIT 1`,[projectId,cycle,rev]);
       const jobs=await all(env.DB,`SELECT type,status,attempts,last_error,created_at,updated_at FROM jobs WHERE project_id=? ORDER BY created_at DESC LIMIT 20`,[projectId]);
-      const runs=await one(env.DB,`SELECT COUNT(*) total,SUM(CASE WHEN r.phase='exploration' THEN 1 ELSE 0 END) exploration,SUM(CASE WHEN r.phase='refinement' THEN 1 ELSE 0 END) refinement,SUM(CASE WHEN r.phase='confirmation' THEN 1 ELSE 0 END) confirmation,SUM(CASE WHEN r.phase IN ('historical','stress') THEN 1 ELSE 0 END) robust FROM simulation_runs r JOIN design_candidates c ON c.id=r.candidate_id WHERE r.project_id=? AND c.research_cycle=?`,[projectId,cycle]);
+      // Self-heal only when the data already fetched for the UI proves a heavy job is stranded.
+      // The previous version ran githubRunnerStatus() on every detail poll, multiplying D1 reads.
+      if(ctx&&String(env.COMPUTE_EXECUTOR||'')==='hybrid'){
+        const stranded=jobs.find(j=>j.type==='compute_candidate'&&j.status==='queued'&&Number(j.attempts||0)===0&&Date.now()-Date.parse(j.created_at||0)>=90000);
+        if(stranded)ctx.waitUntil(recoverHybridStall(env,{reason:'project_detail_stranded'}).catch(()=>null));
+      }
+      const runs={total:Number(counts?.simulation_total||0),exploration:Number(counts?.simulation_exploration||0),refinement:Number(counts?.simulation_refinement||0),confirmation:Number(counts?.simulation_confirmation||0),robust:Number(counts?.simulation_robust||0)};
       const scenarios=await one(env.DB,`SELECT COUNT(*) total,SUM(CASE WHEN scenario_type='historical' THEN 1 ELSE 0 END) historical,SUM(CASE WHEN scenario_type='adversarial' THEN 1 ELSE 0 END) adversarial FROM scenarios WHERE project_id=?`,[projectId]);
       const empirical=await empiricalReadiness(env,projectId);
       const protocol=await latestProtocol(env,projectId);
       const gates=await approvalGates(env,projectId);
       const humanProtocol=safeJson(def?.content_json,{}).validation?.human_protocol||null;
-      const human=await one(env.DB,`SELECT COUNT(*) observations, COUNT(DISTINCT NULLIF(participant_hash,'anonymous')) participants,
-        COUNT(DISTINCT CASE WHEN (? IS NULL OR (trial_id IS NOT NULL AND json_extract(context_json,'$.protocol')=? AND json_extract(context_json,'$.cycle')=?)) THEN NULLIF(participant_hash,'anonymous') END) eligible_participants
-        FROM reviewer_observations WHERE project_id=?`,[humanProtocol,humanProtocol,cycle,projectId]);
+      const human=await humanStats(env,projectId,cycle,humanProtocol);
+
       return json({project:p,definition:def?{...def,gate:safeJson(def.gate_json,{}),content:safeJson(def.content_json,{}),ai:safeJson(def.ai_note,{})}:null,measurement:meas?{...meas,metrics:safeJson(meas.metrics_json,{}),quality:safeJson(meas.quality_json,{})}:null,candidates:{...counts,regret_meta:regretMeta},approval:app?{...app,basis:safeJson(app.basis_json,{})}:null,stale_approval:staleApproval?{...staleApproval,basis:safeJson(staleApproval.basis_json,{})}:null,approval_gates:gates,reviewer:reviewer?{...reviewer,model:safeJson(reviewer.model_json,{})}:null,jobs,runs,scenarios,human_reviews:Number(human?.observations||0),human_participants:Number(human?.participants||0),human_eligible_participants:Number(human?.eligible_participants||0),empirical,protocol});
     }
     if(parts[3]==='run' && method==='POST'){ await run(env.DB,`UPDATE projects SET reviewer_hold_marker=NULL WHERE id=?`,[projectId]); if(env.COMPUTE_EXECUTOR==='github-actions'){await enqueueOnce(env,projectId,'advance_project',{},98);return json({status:'queued',transport:'github-actions'});} const r=await advanceProject(env,projectId); const recovery=env.COMPUTE_EXECUTOR==='hybrid'?await recoverHybridStall(env,{reason:'manual_project_run'}):null; return json({advance:r,recovery,transport:env.COMPUTE_EXECUTOR==='hybrid'?'hybrid-self-heal':env.CDRS_QUEUE?'cloudflare-queue':'d1-fallback'}); }
@@ -174,8 +205,7 @@ async function api(request,env,ctx=null){
     if(parts[3]==='reviewer-observations' && method==='POST'){
       const b=await bodyJson(request);if(b.trial_id){try{const saved=await recordHumanTrial(env,projectId,b);const ev=await registerEvidence(env,projectId,{kind:'HUMAN_TRIAL',source:'calibrated_task_v2',detail:{observation_id:saved.id}});return json({...saved,revalidation:ev},201);}catch(e){return json({error:e.message},400);}} const id=uid('review');
       await env.DB.batch([   // 관측 INSERT + 프로젝트 카운터 증가를 한 batch(원자적)로
-        env.DB.prepare(`INSERT INTO reviewer_observations(id,project_id,participant_hash,ai_confidence,ai_correct,human_accept,response_ms,recovered,recovery_ms,context_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`).bind(id,projectId,String(b.participant_hash||'anon'),Number(b.ai_confidence),b.ai_correct?1:0,b.human_accept?1:0,Number(b.response_ms||0),b.recovered?1:0,b.recovery_ms==null?null:Number(b.recovery_ms),JSON.stringify(b.context||{}),nowIso()),
-        env.DB.prepare(`UPDATE projects SET reviewer_obs_count=reviewer_obs_count+1 WHERE id=?`).bind(projectId)
+        env.DB.prepare(`INSERT INTO reviewer_observations(id,project_id,participant_hash,ai_confidence,ai_correct,human_accept,response_ms,recovered,recovery_ms,context_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`).bind(id,projectId,String(b.participant_hash||'anon'),Number(b.ai_confidence),b.ai_correct?1:0,b.human_accept?1:0,Number(b.response_ms||0),b.recovered?1:0,b.recovery_ms==null?null:Number(b.recovery_ms),JSON.stringify(b.context||{}),nowIso())
       ]);
       const ev=await registerEvidence(env,projectId,{kind:'HUMAN_TRIAL',source:'reviewer_ui',detail:{observation_id:id}}); return json({id,revalidation:ev},201);
     }
@@ -210,10 +240,9 @@ async function api(request,env,ctx=null){
     if(parts[3]==='protocol' && method==='GET'){ const p=await latestProtocol(env,projectId); return p?json(p):json({error:'protocol_not_frozen'},404); }
     if(parts[3]==='scientific-signoff' && method==='POST'){ const b=await bodyJson(request); return json(await scientificSignoff(env,projectId,{reviewer_name:b.reviewer_name||'PI',rationale:b.rationale||''})); }
     if(parts[3]==='report' && method==='GET'){
-      const p=await one(env.DB,`SELECT research_cycle,evidence_revision FROM projects WHERE id=?`,[projectId]); let r=await one(env.DB,`SELECT * FROM reports WHERE project_id=? AND research_cycle=? AND evidence_revision=? AND stale_at IS NULL ORDER BY created_at DESC LIMIT 1`,[projectId,Number(p?.research_cycle||1),Number(p?.evidence_revision||0)]); const stale=!r; if(!r)r=await one(env.DB,`SELECT * FROM reports WHERE project_id=? ORDER BY created_at DESC LIMIT 1`,[projectId]); if(r&&!stale){ try{ r=await upgradeStoredReport(env,projectId,r); }catch(e){ /* 구버전 보고서는 그대로 반환 */ } } const liveHuman=await one(env.DB,`SELECT COUNT(*) observations, COUNT(DISTINCT NULLIF(participant_hash,'anonymous')) participants,
-        COUNT(DISTINCT CASE WHEN ((SELECT json_extract(content_json,'$.validation.human_protocol') FROM definitions WHERE project_id=? ORDER BY version DESC LIMIT 1) IS NULL OR
-        (trial_id IS NOT NULL AND json_extract(context_json,'$.protocol')=(SELECT json_extract(content_json,'$.validation.human_protocol') FROM definitions WHERE project_id=? ORDER BY version DESC LIMIT 1) AND json_extract(context_json,'$.cycle')=?)) THEN NULLIF(participant_hash,'anonymous') END) eligible_participants
-        FROM reviewer_observations WHERE project_id=?`,[projectId,projectId,Number(p?.research_cycle||1),projectId]);
+      const p=await one(env.DB,`SELECT research_cycle,evidence_revision FROM projects WHERE id=?`,[projectId]); let r=await one(env.DB,`SELECT * FROM reports WHERE project_id=? AND research_cycle=? AND evidence_revision=? AND stale_at IS NULL ORDER BY created_at DESC LIMIT 1`,[projectId,Number(p?.research_cycle||1),Number(p?.evidence_revision||0)]); const stale=!r; if(!r)r=await one(env.DB,`SELECT * FROM reports WHERE project_id=? ORDER BY created_at DESC LIMIT 1`,[projectId]); if(r&&!stale){ try{ r=await upgradeStoredReport(env,projectId,r); }catch(e){ /* 구버전 보고서는 그대로 반환 */ } }
+      const hp=await one(env.DB,`SELECT json_extract(content_json,'$.validation.human_protocol') human_protocol FROM definitions WHERE project_id=? ORDER BY version DESC LIMIT 1`,[projectId]);
+      const liveHuman=await humanStats(env,projectId,Number(p?.research_cycle||1),hp?.human_protocol||null);
       const liveNotice=`> 현재 저장된 인간실험: 누적 참가자 ${Number(liveHuman?.participants||0)}명 / 관측 ${Number(liveHuman?.observations||0)}건, 현재 규약·주기 대상 ${Number(liveHuman?.eligible_participants||0)}명.\n> 아래 본문은 보고서 작성 당시의 증거 스냅샷(Cycle ${r?.research_cycle||'-'} · Evidence r${r?.evidence_revision??'-'})입니다.${stale?' 이전 증거 스냅샷 보고서입니다. 최신 보고서는 Actions 실행 후 갱신됩니다.':''} 현재 인원으로 본문의 통계값을 대체하지 않습니다.\n\n`;
       return r?json({...r,stale,live_human:liveHuman,current_cycle:Number(p?.research_cycle||1),current_revision:Number(p?.evidence_revision||0),content_markdown:liveNotice+r.content_markdown,data:safeJson(r.data_json,{})}):json({error:'report_not_ready'},404);
     }
